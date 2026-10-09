@@ -1,0 +1,6 @@
+* text=auto
+*.patch -text
+*.exe -text
+*.ps1 text eol=crlf
+*.md text eol=lf
+*.go text eol=lf
