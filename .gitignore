@@ -1,0 +1,9 @@
+# 体积大 / 可重建的内容不入库
+toolchain/
+cache/
+src/
+evidence/
+junk/
+dist/*.exe
+*.zip
+node_modules/

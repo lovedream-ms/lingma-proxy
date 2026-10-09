@@ -1,0 +1,584 @@
+diff --git a/internal/httpapi/server.go b/internal/httpapi/server.go
+index b9c6f16..dcc7538 100644
+--- a/internal/httpapi/server.go
++++ b/internal/httpapi/server.go
+@@ -57,25 +57,32 @@ type anthropicRequest struct {
+ }
+ 
+ type openAIChatRequest struct {
+-	Model               string       `json:"model"`
+-	Messages            []rawMessage `json:"messages"`
+-	Stream              bool         `json:"stream,omitempty"`
+-	MaxTokens           int          `json:"max_tokens,omitempty"`
+-	MaxCompletionTokens int          `json:"max_completion_tokens,omitempty"`
+-	Tools               any          `json:"tools,omitempty"`
+-	ToolChoice          any          `json:"tool_choice,omitempty"`
+-	ParallelToolCalls   *bool        `json:"parallel_tool_calls,omitempty"`
+-	Temperature         *float64     `json:"temperature,omitempty"`
+-	TopP                *float64     `json:"top_p,omitempty"`
+-	Stop                any          `json:"stop,omitempty"`
+-	PresencePenalty     float64      `json:"presence_penalty,omitempty"`
+-	FrequencyPenalty    float64      `json:"frequency_penalty,omitempty"`
+-	Logprobs            bool         `json:"logprobs,omitempty"`
+-	TopLogprobs         int          `json:"top_logprobs,omitempty"`
+-	ResponseFormat      any          `json:"response_format,omitempty"`
+-	Seed                int          `json:"seed,omitempty"`
+-	User                string       `json:"user,omitempty"`
+-	ReasoningEffort     string       `json:"reasoning_effort,omitempty"`
++	Model               string         `json:"model"`
++	Messages            []rawMessage   `json:"messages"`
++	Stream              bool           `json:"stream,omitempty"`
++	MaxTokens           int            `json:"max_tokens,omitempty"`
++	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
++	Tools               any            `json:"tools,omitempty"`
++	ToolChoice          any            `json:"tool_choice,omitempty"`
++	ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
++	Temperature         *float64       `json:"temperature,omitempty"`
++	TopP                *float64       `json:"top_p,omitempty"`
++	Stop                any            `json:"stop,omitempty"`
++	PresencePenalty     float64        `json:"presence_penalty,omitempty"`
++	FrequencyPenalty    float64        `json:"frequency_penalty,omitempty"`
++	Logprobs            bool           `json:"logprobs,omitempty"`
++	TopLogprobs         int            `json:"top_logprobs,omitempty"`
++	ResponseFormat      any            `json:"response_format,omitempty"`
++	Seed                int            `json:"seed,omitempty"`
++	User                string         `json:"user,omitempty"`
++	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
++	StreamOptions       *streamOptions `json:"stream_options,omitempty"`
++}
++
++// streamOptions mirrors OpenAI's `stream_options` object. Clients set
++// include_usage to ask for a final chunk carrying token usage.
++type streamOptions struct {
++	IncludeUsage bool `json:"include_usage,omitempty"`
+ }
+ 
+ type openAIResponsesRequest struct {
+@@ -466,6 +473,35 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
++// modelContextWindow returns the context window (in tokens) documented for a
++// model so window-aware clients stop seeing the previous hard-coded 128K.
++// Unknown models keep the historical fallback.
++func modelContextWindow(ids ...string) int {
++	const fallback = 128000
++	windows := map[string]int{
++		"kmodel":                256000,
++		"kimi":                  256000,
++		"kimi-k2":               256000,
++		"kimi-k2.6":             256000,
++		"kimi-k2-6":             256000,
++		"mmodel":                204800,
++		"minimax":               204800,
++		"minimax-m2.7":          204800,
++		"qwen3-coder":           256000,
++		"dashscope_qwen3_coder": 256000,
++	}
++	for _, id := range ids {
++		key := strings.ToLower(strings.TrimSpace(id))
++		if key == "" {
++			continue
++		}
++		if window, ok := windows[key]; ok {
++			return window
++		}
++	}
++	return fallback
++}
++
+ func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method == http.MethodOptions {
+ 		w.WriteHeader(http.StatusNoContent)
+@@ -484,19 +520,20 @@ func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
+ 
+ 	items := make([]map[string]any, 0, len(models))
+ 	for _, model := range models {
++		contextWindow := modelContextWindow(model.ID, model.Name)
+ 		items = append(items, map[string]any{
+ 			"id":                 model.ID,
+ 			"key":                model.ID,
+ 			"display_name":       model.Name,
+ 			"type":               "llm",
+ 			"publisher":          "lingma",
+-			"max_context_length": 128000,
++			"max_context_length": contextWindow,
+ 			"loaded_instances": []map[string]any{
+ 				{
+ 					"id":    model.ID,
+ 					"model": model.ID,
+ 					"config": map[string]any{
+-						"context_length": 128000,
++						"context_length": contextWindow,
+ 					},
+ 				},
+ 			},
+@@ -554,11 +591,12 @@ func (s *Server) handleModelProps(w http.ResponseWriter, r *http.Request) {
+ 	if model == "" {
+ 		model = "kmodel"
+ 	}
++	contextWindow := modelContextWindow(model)
+ 	writeJSON(w, http.StatusOK, map[string]any{
+ 		"model_alias":   model,
+ 		"chat_template": "{{ .Messages }}",
+ 		"default_generation_settings": map[string]any{
+-			"n_ctx":       128000,
++			"n_ctx":       contextWindow,
+ 			"temperature": 0.7,
+ 			"top_p":       1,
+ 		},
+@@ -1286,6 +1324,9 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req
+ 			"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
+ 			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
+ 		})
++		if req.IncludeUsage {
++			writeOpenAIUsageChunk(w, flusher, chatID, created, model, result)
++		}
+ 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+ 		flusher.Flush()
+ 		return
+@@ -1449,6 +1490,9 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req
+ 	}); err != nil {
+ 		return
+ 	}
++	if req.IncludeUsage {
++		writeOpenAIUsageChunk(w, flusher, chatID, created, model, final)
++	}
+ 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+ 	flusher.Flush()
+ }
+@@ -1598,6 +1642,14 @@ func shouldAggregateToolStream(req service.ChatRequest) bool {
+ 	return len(req.Tools) > 0 && truthyEnv("LINGMA_AGGREGATE_TOOL_STREAM")
+ }
+ 
++// actionMarkerTailRunes is how many trailing runes stay buffered so an action
++// marker split across stream deltas is still detected before it reaches the
++// client. It only has to cover the longest marker (three backticks plus
++// "json action"), and a smaller tail means the first visible content chunk
++// reaches the client far sooner - which matters because clients time tokens per
++// second from that first chunk.
++const actionMarkerTailRunes = 16
++
+ type toolStreamFilter struct {
+ 	enabled bool
+ 	buffer  string
+@@ -1631,7 +1683,7 @@ func (f *toolStreamFilter) Push(delta string) []string {
+ 	if looksLikeActionPrefix(f.buffer) {
+ 		return nil
+ 	}
+-	return f.flushSafeTail(96)
++	return f.flushSafeTail(actionMarkerTailRunes)
+ }
+ 
+ func (f *toolStreamFilter) Flush() []string {
+@@ -1927,6 +1979,7 @@ func normalizeOpenAIRequest(req openAIChatRequest) (service.ChatRequest, error)
+ 		User:              req.User,
+ 		ReasoningEffort:   req.ReasoningEffort,
+ 		ResponseFormat:    extractResponseFormat(req.ResponseFormat),
++		IncludeUsage:      req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
+ 	}, nil
+ }
+ 
+@@ -2320,14 +2373,65 @@ func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult
+ 			"message":       message,
+ 			"finish_reason": finishReason,
+ 		}},
+-		"usage": map[string]any{
+-			"prompt_tokens":     result.InputTokens,
+-			"completion_tokens": result.OutputTokens,
+-			"total_tokens":      result.InputTokens + result.OutputTokens,
+-		},
++		"usage": openAIUsagePayload(result),
++	})
++}
++
++// writeOpenAIUsageChunk emits the OpenAI-compatible trailing usage chunk
++// (`choices: []` + `usage`). Per the OpenAI streaming spec it is sent after the
++// finish chunk and before `data: [DONE]`; clients need it to display token
++// counts, token speed and context-window usage.
++func writeOpenAIUsageChunk(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model string, result *service.ChatResult) {
++	_ = writeOpenAIChunk(w, flusher, map[string]any{
++		"id":      chatID,
++		"object":  "chat.completion.chunk",
++		"created": created,
++		"model":   model,
++		"choices": []map[string]any{},
++		"usage":   openAIUsagePayload(result),
+ 	})
+ }
+ 
++// openAIUsagePayload builds the OpenAI usage object shared by the streaming and
++// non-streaming chat completions endpoints. Real, backend-reported counts win
++// over the local estimate: the Lingma IPC backend reports the true context
++// occupancy (UsedTokens) and the remote backend forwards upstream usage when
++// the upstream sends it. Cache-read and reasoning details are only advertised
++// when they are actually known, so clients never show a fabricated hit rate.
++func openAIUsagePayload(result *service.ChatResult) map[string]any {
++	promptTokens := 0
++	completionTokens := 0
++	cachedTokens := 0
++	reasoningTokens := 0
++	if result != nil {
++		promptTokens = result.InputTokens
++		completionTokens = result.OutputTokens
++		cachedTokens = result.CachedTokens
++		reasoningTokens = result.ReasoningTokens
++		if result.UsedTokens > 0 {
++			promptTokens = result.UsedTokens
++		}
++	}
++	if promptTokens < 0 {
++		promptTokens = 0
++	}
++	if completionTokens < 0 {
++		completionTokens = 0
++	}
++	usage := map[string]any{
++		"prompt_tokens":     promptTokens,
++		"completion_tokens": completionTokens,
++		"total_tokens":      promptTokens + completionTokens,
++	}
++	if cachedTokens > 0 {
++		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cachedTokens}
++	}
++	if reasoningTokens > 0 {
++		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoningTokens}
++	}
++	return usage
++}
++
+ func writeOpenAIResponse(w http.ResponseWriter, result *service.ChatResult) {
+ 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
+ 	created := time.Now().Unix()
+diff --git a/internal/remote/client.go b/internal/remote/client.go
+index e91b0c2..b6ec7d3 100644
+--- a/internal/remote/client.go
++++ b/internal/remote/client.go
+@@ -89,12 +89,14 @@ type Message struct {
+ }
+ 
+ type ChatResult struct {
+-	Text          string
+-	InputTokens   int
+-	OutputTokens  int
+-	RequestID     string
+-	CredentialSrc string
+-	ToolCalls     []toolemulation.ToolCall
++	Text            string
++	InputTokens     int
++	OutputTokens    int
++	CachedTokens    int
++	ReasoningTokens int
++	RequestID       string
++	CredentialSrc   string
++	ToolCalls       []toolemulation.ToolCall
+ }
+ 
+ type StreamEvent struct {
+@@ -374,14 +376,22 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
+ 		return nil, fmt.Errorf("remote chat status %d: %s", resp.StatusCode, truncate(string(respBody), 1000))
+ 	}
+ 	var builder strings.Builder
++	var reasoningBuilder strings.Builder
++	var lastUsage *remoteUsage
+ 	toolCallBuffer := newRemoteToolCallBuffer()
+ 	if err := scanSSE(resp.Body, func(event sseEvent) error {
+ 		if event.Done {
+ 			return nil
+ 		}
++		if event.Usage != nil {
++			lastUsage = event.Usage
++		}
+ 		if len(event.ToolCalls) > 0 {
+ 			toolCallBuffer.Add(event.ToolCalls)
+ 		}
++		if event.Reasoning != "" {
++			reasoningBuilder.WriteString(event.Reasoning)
++		}
+ 		if event.Content == "" {
+ 			return nil
+ 		}
+@@ -393,15 +403,51 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
+ 	}); err != nil {
+ 		return nil, err
+ 	}
+-	text := builder.String()
+-	return &ChatResult{
++	return buildChatResult(request, builder.String(), reasoningBuilder.String(), lastUsage, requestID, cred.Source, toolCallBuffer.Calls()), nil
++}
++
++// buildChatResult prefers token counts reported by the upstream and falls back
++// to local estimates when the upstream streams no usage at all.
++func buildChatResult(
++	request ChatRequest,
++	text string,
++	reasoning string,
++	usage *remoteUsage,
++	requestID string,
++	credentialSource string,
++	toolCalls []toolemulation.ToolCall,
++) *ChatResult {
++	result := &ChatResult{
+ 		Text:          text,
+-		InputTokens:   estimateTokens(request.Prompt),
+-		OutputTokens:  estimateTokens(text),
+ 		RequestID:     requestID,
+-		CredentialSrc: cred.Source,
+-		ToolCalls:     toolCallBuffer.Calls(),
+-	}, nil
++		CredentialSrc: credentialSource,
++		ToolCalls:     toolCalls,
++	}
++	if usage != nil && usage.PromptTokens > 0 {
++		result.InputTokens = usage.PromptTokens
++	} else {
++		result.InputTokens = estimateTokens(request.Prompt)
++	}
++	if usage != nil && usage.CompletionTokens > 0 {
++		result.OutputTokens = usage.CompletionTokens
++	} else {
++		result.OutputTokens = estimateTokens(text)
++	}
++	result.CachedTokens = usage.cacheReadTokens()
++	if reasoningTokens := usage.reasoningTokens(); reasoningTokens > 0 {
++		result.ReasoningTokens = reasoningTokens
++	} else {
++		result.ReasoningTokens = estimateTokensOrZero(reasoning)
++	}
++	return result
++}
++
++// estimateTokensOrZero estimates tokens but reports empty text as zero.
++func estimateTokensOrZero(text string) int {
++	if strings.TrimSpace(text) == "" {
++		return 0
++	}
++	return estimateTokens(text)
+ }
+ 
+ func (c *Client) buildBody(requestID string, request ChatRequest) (string, error) {
+@@ -707,15 +753,59 @@ type outerSSE struct {
+ type innerSSE struct {
+ 	Choices []struct {
+ 		Delta struct {
+-			Content   string                `json:"content"`
+-			ToolCalls []remoteToolCallDelta `json:"tool_calls"`
++			Content          string                `json:"content"`
++			ReasoningContent string                `json:"reasoning_content"`
++			ToolCalls        []remoteToolCallDelta `json:"tool_calls"`
+ 		} `json:"delta"`
++		Usage *remoteUsage `json:"usage"`
+ 	} `json:"choices"`
++	Usage *remoteUsage `json:"usage"`
++}
++
++// remoteUsage mirrors the OpenAI usage object. Upstreams differ in where they
++// hang cached and reasoning counts, so every documented spelling is decoded.
++type remoteUsage struct {
++	PromptTokens        int `json:"prompt_tokens"`
++	CompletionTokens    int `json:"completion_tokens"`
++	TotalTokens         int `json:"total_tokens"`
++	CachedTokens        int `json:"cached_tokens"`
++	PromptTokensDetails *struct {
++		CachedTokens int `json:"cached_tokens"`
++	} `json:"prompt_tokens_details"`
++	CompletionTokensDetails *struct {
++		ReasoningTokens int `json:"reasoning_tokens"`
++	} `json:"completion_tokens_details"`
++}
++
++// cacheReadTokens returns the reported prompt-cache hit tokens, preferring the
++// nested prompt_tokens_details spelling (Kimi also documents a top-level one).
++func (u *remoteUsage) cacheReadTokens() int {
++	if u == nil {
++		return 0
++	}
++	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
++		return u.PromptTokensDetails.CachedTokens
++	}
++	if u.CachedTokens > 0 {
++		return u.CachedTokens
++	}
++	return 0
++}
++
++// reasoningTokens returns the reasoning tokens the upstream reports separately
++// from the visible completion tokens.
++func (u *remoteUsage) reasoningTokens() int {
++	if u == nil || u.CompletionTokensDetails == nil {
++		return 0
++	}
++	return u.CompletionTokensDetails.ReasoningTokens
+ }
+ 
+ type sseEvent struct {
+ 	Content   string
++	Reasoning string
+ 	ToolCalls []remoteToolCallFragment
++	Usage     *remoteUsage
+ 	Done      bool
+ }
+ 
+@@ -782,9 +872,15 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
+ 		return sseEvent{}, false, err
+ 	}
+ 	var builder strings.Builder
++	var reasoningBuilder strings.Builder
+ 	var toolCalls []remoteToolCallFragment
++	usage := inner.Usage
+ 	for _, choice := range inner.Choices {
+ 		builder.WriteString(choice.Delta.Content)
++		reasoningBuilder.WriteString(choice.Delta.ReasoningContent)
++		if usage == nil && choice.Usage != nil {
++			usage = choice.Usage
++		}
+ 		for _, tc := range choice.Delta.ToolCalls {
+ 			toolCalls = append(toolCalls, remoteToolCallFragment{
+ 				Index:             tc.Index,
+@@ -795,7 +891,7 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
+ 			})
+ 		}
+ 	}
+-	return sseEvent{Content: builder.String(), ToolCalls: toolCalls}, true, nil
++	return sseEvent{Content: builder.String(), Reasoning: reasoningBuilder.String(), ToolCalls: toolCalls, Usage: usage}, true, nil
+ }
+ 
+ type remoteToolCallBuffer struct {
+@@ -1372,12 +1468,42 @@ func isKnownEnterpriseRemoteHost(host string) bool {
+ 		strings.Contains(host, "qoder")
+ }
+ 
++// estimateTokens approximates a tokenizer without shipping one: CJK and other
++// full-width scripts cost roughly one token per character while ASCII costs
++// roughly one token per four characters. It replaces a flat rune/N heuristic
++// that under-counted Chinese prompts by a factor of two or more.
+ func estimateTokens(text string) int {
+ 	text = strings.TrimSpace(text)
+ 	if text == "" {
+ 		return 0
+ 	}
+-	return len([]rune(text)) / 4
++	cjk := 0
++	ascii := 0
++	for _, r := range text {
++		if isWideRune(r) {
++			cjk++
++			continue
++		}
++		ascii++
++	}
++	keep := float64(cjk)*0.7 + float64(ascii)*0.25
++	return 1 + int(keep)
++}
++
++// isWideRune reports whether a rune belongs to a script that byte-pair
++// tokenizers usually emit as its own token.
++func isWideRune(r rune) bool {
++	return (r >= 0x1100 && r <= 0x11FF) ||
++		(r >= 0x2E80 && r <= 0x303F) ||
++		(r >= 0x3040 && r <= 0x30FF) ||
++		(r >= 0x3130 && r <= 0x318F) ||
++		(r >= 0x3400 && r <= 0x4DBF) ||
++		(r >= 0x4E00 && r <= 0x9FFF) ||
++		(r >= 0xA960 && r <= 0xA97F) ||
++		(r >= 0xAC00 && r <= 0xD7AF) ||
++		(r >= 0xF900 && r <= 0xFAFF) ||
++		(r >= 0xFF00 && r <= 0xFFEF) ||
++		(r >= 0x20000 && r <= 0x2FA1F)
+ }
+ 
+ func truncate(value string, max int) string {
+diff --git a/internal/service/service.go b/internal/service/service.go
+index 43e5b56..7aa17c7 100644
+--- a/internal/service/service.go
++++ b/internal/service/service.go
+@@ -94,6 +94,11 @@ type ChatRequest struct {
+ 	User             string
+ 	ReasoningEffort  string
+ 	ResponseFormat   string // "json" or "json_schema"
++
++	// IncludeUsage mirrors OpenAI's stream_options.include_usage: when true the
++	// HTTP streaming handlers append a final usage chunk before [DONE] so that
++	// clients can display token counts, token speed and context usage.
++	IncludeUsage bool
+ }
+ 
+ type ChatResult struct {
+@@ -108,6 +113,8 @@ type ChatResult struct {
+ 	StopReason       string
+ 	UsedTokens       int
+ 	LimitTokens      int
++	CachedTokens     int
++	ReasoningTokens  int
+ 	ThinkingDuration int64
+ 	PipePath         string
+ 	Endpoint         string
+@@ -502,6 +509,8 @@ func (s *Service) generateRemoteWithModel(
+ 		Model:            valueOr(strings.TrimSpace(model), "lingma"),
+ 		InputTokens:      remoteResult.InputTokens,
+ 		OutputTokens:     remoteResult.OutputTokens,
++		CachedTokens:     remoteResult.CachedTokens,
++		ReasoningTokens:  remoteResult.ReasoningTokens,
+ 		SessionID:        "",
+ 		RequestID:        remoteResult.RequestID,
+ 		FinishReason:     "stop",
+@@ -1090,6 +1099,7 @@ func (s *Service) buildChatResult(
+ 		Model:            valueOr(strings.TrimSpace(req.Model), "lingma"),
+ 		InputTokens:      estimateTokens(prompt),
+ 		OutputTokens:     estimateTokens(runResult.AssistantText),
++		ReasoningTokens:  estimateTokensOrZero(runResult.ThoughtText),
+ 		SessionID:        sessionID,
+ 		RequestID:        requestID,
+ 		FinishReason:     nestedString(runResult.FinishData, "reason"),
+@@ -1559,12 +1569,50 @@ func reasoningSystemHint(effort string) string {
+ 	}
+ }
+ 
++// estimateTokens approximates a tokenizer without shipping one: CJK and other
++// full-width scripts cost roughly one token per character while ASCII costs
++// roughly one token per four characters. It replaces a flat rune/N heuristic
++// that under-counted Chinese prompts by a factor of two or more.
+ func estimateTokens(text string) int {
+ 	text = strings.TrimSpace(text)
+ 	if text == "" {
+ 		return 1
+ 	}
+-	return max(1, (len([]rune(text))+2)/3)
++	cjk := 0
++	ascii := 0
++	for _, r := range text {
++		if isWideRune(r) {
++			cjk++
++			continue
++		}
++		ascii++
++	}
++	keep := float64(cjk)*0.7 + float64(ascii)*0.25
++	return max(1, 1+int(keep))
++}
++
++// estimateTokensOrZero estimates tokens but reports empty text as zero.
++func estimateTokensOrZero(text string) int {
++	if strings.TrimSpace(text) == "" {
++		return 0
++	}
++	return estimateTokens(text)
++}
++
++// isWideRune reports whether a rune belongs to a script that byte-pair
++// tokenizers usually emit as its own token.
++func isWideRune(r rune) bool {
++	return (r >= 0x1100 && r <= 0x11FF) ||
++		(r >= 0x2E80 && r <= 0x303F) ||
++		(r >= 0x3040 && r <= 0x30FF) ||
++		(r >= 0x3130 && r <= 0x318F) ||
++		(r >= 0x3400 && r <= 0x4DBF) ||
++		(r >= 0x4E00 && r <= 0x9FFF) ||
++		(r >= 0xA960 && r <= 0xA97F) ||
++		(r >= 0xAC00 && r <= 0xD7AF) ||
++		(r >= 0xF900 && r <= 0xFAFF) ||
++		(r >= 0xFF00 && r <= 0xFFEF) ||
++		(r >= 0x20000 && r <= 0x2FA1F)
+ }
+ 
+ func extractModels(raw any) []Model {
