@@ -1,0 +1,19 @@
+# Patches for lingma-proxy to fix token usage reporting
+
+This patch addresses the issue where lingma-proxy doesn't properly handle `stream_options.include_usage` in OpenAI-compatible API calls, resulting in missing token usage information in streaming responses.
+
+## Changes Made
+
+1. Added support for parsing `stream_options.include_usage` in the request model
+2. Modified the streaming response to include usage information when requested
+3. Improved token counting accuracy by using real upstream usage data instead of character-based estimates
+4. Fixed context window reporting to use actual values instead of hardcoded 128000
+
+## Technical Details
+
+The patch modifies three main files:
+- internal/httpapi/server.go: Added StreamOptions parsing and usage frame emission
+- internal/remote/client.go: Enhanced SSE parsing to extract real usage data
+- internal/service/service.go: Updated token calculation methods
+
+The solution properly handles the OpenAI specification requirement for streaming responses with `stream_options.include_usage=true`, ensuring that clients can accurately display token usage statistics.

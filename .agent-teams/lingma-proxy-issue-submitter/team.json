@@ -1,0 +1,12 @@
+{
+  "name": "lingma-proxy-issue-submitter",
+  "id": "lingma-proxy-issue-submitter",
+  "description": "Submit issue fix for lingma-proxy repository",
+  "captainSessionId": "session-1a98a7d7-c916-4757-8855-b4ecb1584a5c",
+  "createdAt": 1791526917515,
+  "members": [],
+  "tasks": [],
+  "taskSeq": 0,
+  "phase": "staged",
+  "planReviewState": "awaiting_review"
+}
