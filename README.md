@@ -85,3 +85,12 @@ data: {"choices":[],"created":...,"id":"chatcmpl-...","model":"kmodel","object":
 1. 落地路径三选一：GUI 版常驻 8095（当前即 GUI 版）/ 无头版换 8096 常驻 / 保持现状。
 2. 是否实现工具模拟 P1–P5 修复（候选：纯 tool_calls 的 assistant 消息不再丢弃、未知工具名兜底映射到 run_code 的 `tools.<name>()`、长度闸门先剥离 action 代码块、补中文 needle）。
 3. 把 `docs/lingma-proxy-usage-issue.md` 提到上游仓库。
+
+## 迁移后自检（2026-10-09）
+
+- `scripts/build-headless.ps1`（用项目内 toolchain + 迁移后的 cache）→ `OK -> dist\lingma-proxy-fixed.exe (13021184 bytes)`。
+- 无头版起 8098 冒烟：`/health` 正常；一次带 `stream_options.include_usage` 的流式请求返回 6 帧且含 `"usage"`；随后已停掉 8098。
+- `patches/lingma-proxy-usage-fix.patch` 在 `evidence/verify-clone` 上 `git apply --check --reverse` exit 0（工作区恰为 3 个 M）。
+- `src/lingma-proxy` 的补丁已提交到本地分支 `usage-fix`（`063e1df`），上游 v1.6.12 基线为 `ede4557`。
+- 8095 当前由 GUI 版（原 HelloFnos 路径启动，文件已迁到 `dist\LingmaProxy-gui-fixed.exe`）服务，`/health` 正常；以后重启请直接用新路径。
+
