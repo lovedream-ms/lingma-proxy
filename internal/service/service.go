@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"lingma-ipc-proxy/internal/lingmaipc"
+	"lingma-ipc-proxy/internal/modelmeta"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/toolemulation"
+	"lingma-ipc-proxy/internal/utils"
 )
 
 type BackendMode string
@@ -37,26 +39,31 @@ const (
 const ipcSetupTimeout = 15 * time.Second
 
 type Config struct {
-	Host                  string
-	Port                  int
-	Backend               BackendMode
-	Transport             lingmaipc.Transport
-	Pipe                  string
-	WebSocketURL          string
-	RemoteBaseURL         string
-	RemoteAuthFile        string
-	RemoteProxyURL        string
-	RemoteVersion         string
-	Cwd                   string
-	CurrentFilePath       string
-	Mode                  string
-	Model                 string
-	ShellType             string
-	SessionMode           SessionMode
-	Timeout               time.Duration
-	WarmupTimeout         time.Duration
-	RemoteFallbackEnabled bool
-	RemoteFallbackModels  []string
+	MaxConcurrentRequests  int
+	RemoteRetryCount       *int
+	RemoteRetryBaseDelayMS int
+	AggregateToolStream    *bool
+	Host                   string
+	Port                   int
+	Backend                BackendMode
+	Transport              lingmaipc.Transport
+	Pipe                   string
+	WebSocketURL           string
+	RemoteBaseURL          string
+	RemoteAuthFile         string
+	RemoteProxyURL         string
+	RemoteVersion          string
+	Cwd                    string
+	CurrentFilePath        string
+	Mode                   string
+	Model                  string
+	ShellType              string
+	SessionMode            SessionMode
+	Timeout                time.Duration
+	WarmupTimeout          time.Duration
+	RemoteFallbackEnabled  bool
+	RemoteFallbackModels   []string
+	AutoStartOnBoot        bool // Whether to start the proxy automatically on system boot
 }
 
 type Image struct {
@@ -74,12 +81,14 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Model             string
-	System            string
-	Messages          []ChatMessage
-	Tools             []toolemulation.ToolDef
-	ToolChoice        toolemulation.ToolChoice
-	ParallelToolCalls *bool
+	AggregateToolStream *bool
+	StreamNativeTools   bool
+	Model               string
+	System              string
+	Messages            []ChatMessage
+	Tools               []toolemulation.ToolDef
+	ToolChoice          toolemulation.ToolChoice
+	ParallelToolCalls   *bool
 
 	// Generation parameters (passed through for API compatibility;
 	// actual effect depends on Lingma backend support)
@@ -94,31 +103,48 @@ type ChatRequest struct {
 	User             string
 	ReasoningEffort  string
 	ResponseFormat   string // "json" or "json_schema"
+
+	// IncludeUsage mirrors OpenAI's stream_options.include_usage: when true the
+	// HTTP streaming handlers append a final usage chunk before [DONE] so that
+	// clients can display token counts, token speed and context usage.
+	IncludeUsage bool
 }
 
 type ChatResult struct {
-	Text             string
-	ThoughtText      string
-	Model            string
-	InputTokens      int
-	OutputTokens     int
-	SessionID        string
-	RequestID        string
-	FinishReason     string
-	StopReason       string
-	UsedTokens       int
-	LimitTokens      int
-	ThinkingDuration int64
-	PipePath         string
-	Endpoint         string
-	Transport        string
-	EffectiveSession SessionMode
-	ToolCalls        []toolemulation.ToolCall
+	ContextUsageKnown     bool
+	ContextUsageEstimated bool
+	StreamedTokenEvents   int
+	Text                  string
+	ThoughtText           string
+	Model                 string
+	InputTokens           int
+	OutputTokens          int
+	InputTokensEstimated  bool
+	OutputTokensEstimated bool
+	SessionID             string
+	RequestID             string
+	FinishReason          string
+	StopReason            string
+	UsedTokens            int
+	LimitTokens           int
+	CachedTokens          int
+	ReasoningTokens       int
+	ThinkingDuration      int64
+	PipePath              string
+	Endpoint              string
+	Transport             string
+	EffectiveSession      SessionMode
+	ToolCalls             []toolemulation.ToolCall
+	StartTime             time.Time // Request start, before upstream work.
+	FirstTokenTime        time.Time // First upstream text, reasoning, or tool fragment.
+	EndTime               time.Time // Upstream completion time.
+	OutputSpeed           float64   // Tokens per second, based on measured upstream time.
 }
 
 type StreamEvent struct {
-	Type  string
-	Delta string
+	ToolDelta *remote.ToolCallFragment
+	Type      string
+	Delta     string
 }
 
 type StreamResult struct {
@@ -127,13 +153,20 @@ type StreamResult struct {
 }
 
 type Model struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Scene      string `json:"scene,omitempty"`
-	InternalID string `json:"-"`
+	MaxContextLength    int    `json:"max_context_length,omitempty"`
+	ContextOptions      []int  `json:"context_options,omitempty"`
+	MaxInputTokens      int    `json:"max_input_tokens,omitempty"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	Scene               string `json:"scene,omitempty"`
+	InternalID          string `json:"-"`
+	ContextWindow       int    `json:"context_window,omitempty"`
+	SupportsVision      bool   `json:"supports_vision,omitempty"`
+	SupportsVisionKnown bool   `json:"-"`
 }
 
 type State struct {
+	Warning         string      `json:"warning,omitempty"`
 	PipePath        string      `json:"pipe_path,omitempty"`
 	Endpoint        string      `json:"endpoint,omitempty"`
 	Transport       string      `json:"transport,omitempty"`
@@ -151,6 +184,7 @@ type Service struct {
 	transport        lingmaipc.Transport
 	stickySessionID  string
 	stickyModelID    string
+	modelLimits      map[string]int
 	modelMap         map[string]string // official name -> internal id
 	remoteClient     *remote.Client
 	remoteProbeCache map[string]remoteModelProbeEntry
@@ -167,6 +201,7 @@ type promptRunResult struct {
 }
 
 const (
+	StreamEventTool     = "tool"
 	StreamEventText     = "text"
 	StreamEventThinking = "thinking"
 )
@@ -177,6 +212,7 @@ type remoteModelProbeEntry struct {
 }
 
 func New(cfg Config) *Service {
+	cfg = NormalizeRuntimeSettings(cfg)
 	if strings.TrimSpace(cfg.Cwd) == "" {
 		if wd, err := os.Getwd(); err == nil {
 			cfg.Cwd = wd
@@ -232,7 +268,8 @@ func (s *Service) DefaultModel() string {
 
 func (s *Service) Warmup(ctx context.Context) error {
 	if s.backend() == BackendRemote {
-		return s.remoteClientLocked().Warmup(ctx)
+		_, err := s.ListModels(ctx)
+		return err
 	}
 	_, err := s.ensureConnected(ctx)
 	return err
@@ -267,6 +304,7 @@ func (s *Service) State() State {
 	defer s.mu.Unlock()
 	if s.cfg.Backend == BackendRemote {
 		return State{
+			Warning:     remote.CredentialCompatibilityWarning(s.cfg.RemoteAuthFile),
 			Endpoint:    remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
 			Transport:   "remote",
 			Connected:   s.remoteClient != nil,
@@ -287,7 +325,7 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	if s.backend() == BackendRemote {
 		models, err := s.remoteClientLocked().ListModels(ctx)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list remote models: %w", err)
 		}
 		out := make([]Model, 0, len(models))
 		seen := map[string]bool{}
@@ -301,30 +339,53 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 			if name == "" {
 				name = id
 			}
-			out = append(out, Model{ID: id, Name: name})
+			// Copy context window and vision support info from remote model
+			out = append(out, Model{
+				ID:                  id,
+				Name:                name,
+				ContextWindow:       model.ContextWindow,
+				MaxContextLength:    model.MaxContextLength,
+				ContextOptions:      model.ContextOptions,
+				MaxInputTokens:      model.MaxInputTokens,
+				SupportsVision:      model.SupportsVision,
+				SupportsVisionKnown: model.SupportsVisionKnown,
+			})
 		}
-		out = append(out, s.verifiedRemoteFallbackModels(ctx, seen)...)
+		// Discovery must not generate billable chat requests to probe missing aliases.
+		s.mu.Lock()
+		s.modelMap = make(map[string]string, len(out)*2)
+		s.modelLimits = make(map[string]int, len(out)*2)
+		for _, model := range out {
+			s.modelMap[model.ID] = model.ID
+			s.modelLimits[model.ID] = model.ContextWindow
+			s.modelLimits[strings.ToLower(model.Name)] = model.ContextWindow
+			s.modelMap[strings.ToLower(model.Name)] = model.ID
+		}
+		s.mu.Unlock()
 		return out, nil
 	}
 
 	ipcClient, err := s.ensureConnected(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to IPC: %w", err)
 	}
 
 	var raw any
 	if err := ipcClient.Request(ctx, "config/queryModels", map[string]any{}, &raw); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query models via IPC: %w", err)
 	}
 
 	models := extractModels(raw)
 	if len(models) == 0 {
-		models = []Model{{ID: "lingma", Name: "Lingma", Scene: "default"}}
+		return nil, fmt.Errorf("IPC model catalogue contains no enabled models - this might indicate an issue with the underlying Lingma service")
 	}
 
 	s.mu.Lock()
 	s.modelMap = make(map[string]string, len(models))
+	s.modelLimits = make(map[string]int, len(models)*2)
 	for _, m := range models {
+		s.modelLimits[m.ID] = m.ContextWindow
+		s.modelLimits[m.InternalID] = m.ContextWindow
 		if m.InternalID != "" {
 			s.modelMap[m.ID] = m.InternalID
 		}
@@ -334,7 +395,16 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
-func (s *Service) Generate(ctx context.Context, req ChatRequest) (*ChatResult, error) {
+func (s *Service) Generate(ctx context.Context, req ChatRequest) (result *ChatResult, err error) {
+	started := time.Now()
+	defer func() {
+		if result != nil {
+			result.StartTime = started
+			result.EndTime = time.Now()
+			s.completeContextUsage(result)
+		}
+	}()
+
 	if s.backend() == BackendRemote {
 		return s.generateRemote(ctx, req, nil)
 	}
@@ -346,13 +416,20 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 	done := make(chan StreamResult, 1)
 
 	go func() {
+		started := time.Now()
+		var firstToken time.Time
+		streamedTokenEvents := 0
 		generate := s.generateWithReconnect
 		if s.backend() == BackendRemote {
 			generate = s.generateRemote
 		}
 		result, err := generate(ctx, req, func(event StreamEvent) {
-			if event.Delta == "" {
+			if event.Delta == "" && event.ToolDelta == nil {
 				return
+			}
+			streamedTokenEvents++
+			if firstToken.IsZero() {
+				firstToken = time.Now()
 			}
 			select {
 			case events <- event:
@@ -360,12 +437,36 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 			}
 		})
 
+		if result != nil {
+			result.StreamedTokenEvents = streamedTokenEvents
+			result.StartTime = started
+			result.FirstTokenTime = firstToken
+			result.EndTime = time.Now()
+			s.completeContextUsage(result)
+		}
 		close(events)
 		done <- StreamResult{Result: result, Err: err}
 		close(done)
 	}()
 
 	return events, done, nil
+}
+
+// completeContextUsage keeps unknown occupancy distinct from an empty context.
+// Per-request input includes cache reads; they must never be added a second time.
+func (s *Service) completeContextUsage(result *ChatResult) {
+	if result.LimitTokens == 0 {
+		s.mu.Lock()
+		result.LimitTokens = s.modelLimits[result.Model]
+		if result.LimitTokens == 0 {
+			result.LimitTokens = s.modelLimits[strings.ToLower(result.Model)]
+		}
+		s.mu.Unlock()
+	}
+	if !result.ContextUsageKnown && result.UsedTokens <= 0 && result.InputTokens+result.OutputTokens > 0 {
+		result.UsedTokens = max(0, result.InputTokens) + max(0, result.OutputTokens)
+		result.ContextUsageEstimated = true
+	}
 }
 
 func (s *Service) generateWithReconnect(
@@ -406,8 +507,8 @@ func (s *Service) generateRemoteInternal(
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.DefaultModel()
 	}
-	req.Model = normalizeModelForBackend(BackendRemote, req.Model)
-	prompt, err := buildLingmaPrompt(req, SessionModeFresh, emulateTools)
+	req.Model = s.resolveRemoteModelID(req.Model)
+	prompt, err := buildLingmaPrompt(req, SessionModeFresh, false)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +529,16 @@ func (s *Service) generateRemoteInternal(
 		lastErr = err
 		if i == len(models)-1 || emitted || !isRemoteFallbackError(err) {
 			return nil, err
+		}
+		var upstream *remote.UpstreamError
+		if errors.As(err, &upstream) && upstream.RetryAfter > 0 {
+			timer := time.NewTimer(upstream.RetryAfter)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	return nil, lastErr
@@ -456,19 +567,45 @@ func (s *Service) generateRemoteWithModel(
 	onDelta func(StreamEvent),
 	emulateTools bool,
 ) (*ChatResult, bool, error) {
+	// Short speculative preambles cannot be retracted after streaming.
 	emitted := false
+	var pending strings.Builder
 	delta := func(text string) {
-		if text != "" {
-			emitted = true
+		if onDelta == nil || text == "" {
+			return
 		}
-		if onDelta != nil {
-			onDelta(StreamEvent{Type: StreamEventText, Delta: text})
+		if !emitted && emulateTools {
+			pending.WriteString(text)
+			candidate := pending.String()
+			if len([]rune(candidate)) <= 180 || looksLikeToolSyntax(candidate) ||
+				toolemulation.LooksLikeMissedToolUse(candidate) || toolemulation.LooksLikeRefusal(candidate) {
+				return
+			}
+			text = candidate
+			pending.Reset()
+		}
+		emitted = true
+		onDelta(StreamEvent{Type: StreamEventText, Delta: text})
+	}
+	reasoningDelta := func(text string) {
+		if onDelta != nil && text != "" {
+			emitted = true
+			onDelta(StreamEvent{Type: StreamEventThinking, Delta: text})
+		}
+	}
+	var toolDelta func(remote.ToolCallFragment)
+	if onDelta != nil && req.StreamNativeTools {
+		toolDelta = func(call remote.ToolCallFragment) {
+			emitted = true
+			onDelta(StreamEvent{Type: StreamEventTool, ToolDelta: &call})
 		}
 	}
 	remoteResult, err := client.Chat(ctx, remote.ChatRequest{
+		OnReasoning:     reasoningDelta,
+		OnToolDelta:     toolDelta,
 		Model:           model,
 		Prompt:          prompt,
-		Messages:        remoteMessagesForChat(req, prompt, emulateTools),
+		Messages:        remoteMessagesForChat(req, prompt, false),
 		Images:          remoteImagesFromRequest(req),
 		Stream:          onDelta != nil,
 		Temperature:     req.Temperature,
@@ -479,64 +616,131 @@ func (s *Service) generateRemoteWithModel(
 	if err != nil {
 		return nil, emitted, err
 	}
-	if len(remoteResult.ToolCalls) == 0 && shouldRetryRemoteNativeTool(req, remoteResult.Text) {
-		retryResult, retryErr := client.Chat(ctx, remote.ChatRequest{
-			Model:           model,
-			Prompt:          prompt,
-			Messages:        remoteMessagesForChat(req, prompt, emulateTools),
-			Images:          remoteImagesFromRequest(req),
-			Stream:          false,
-			Temperature:     req.Temperature,
-			ReasoningEffort: req.ReasoningEffort,
-			Tools:           req.Tools,
-			ToolChoice:      toolemulation.ToolChoice{Mode: "any"},
-		}, nil)
-		if retryErr == nil && len(retryResult.ToolCalls) > 0 {
+	if len(req.Tools) > 0 {
+		normalizeErr := normalizeRemoteToolResult(req, remoteResult)
+		needsRetry := normalizeErr != nil || (len(remoteResult.ToolCalls) == 0 &&
+			shouldRetryRemoteNativeTool(req, remoteResult.Text))
+		if needsRetry && !emitted && req.ToolChoice.Mode != "none" {
+			repairPrompt, promptErr := buildLingmaPrompt(req, SessionModeFresh, true)
+			if promptErr != nil {
+				return nil, emitted, promptErr
+			}
+			rejected, _ := json.Marshal(map[string]any{"text": remoteResult.Text, "tool_calls": remoteResult.ToolCalls})
+			repairPrompt += "\n\nRejected assistant output (data to correct):\n" + string(rejected)
+			repairPrompt += "\n\n" + toolemulation.ForceToolingPrompt(req.ToolChoice)
+			if normalizeErr != nil {
+				repairPrompt += "\nThe previous tool call violated the tool contract: " + normalizeErr.Error() + ". Correct its name and argument schema."
+			}
+			retryResult, retryErr := client.Chat(ctx, remote.ChatRequest{
+				Model: model, Prompt: repairPrompt,
+				Messages: remoteMessagesForChat(req, repairPrompt, true),
+				Images:   remoteImagesFromRequest(req), Stream: false,
+				Temperature: req.Temperature, ReasoningEffort: req.ReasoningEffort,
+				// Repair uses action blocks without competing native definitions.
+			}, nil)
+			if retryErr != nil {
+				return nil, emitted, retryErr
+			}
+			if err := normalizeRemoteToolResult(req, retryResult); err != nil {
+				return nil, emitted, err
+			}
+			if len(retryResult.ToolCalls) == 0 {
+				return nil, emitted, errors.New("tool repair failed: no valid tool call after one retry")
+			}
 			remoteResult = retryResult
-			emitted = false
+		} else if normalizeErr != nil {
+			return nil, emitted, normalizeErr
 		}
 	}
 
 	result := &ChatResult{
-		Text:             remoteResult.Text,
-		Model:            valueOr(strings.TrimSpace(model), "lingma"),
-		InputTokens:      remoteResult.InputTokens,
-		OutputTokens:     remoteResult.OutputTokens,
-		SessionID:        "",
-		RequestID:        remoteResult.RequestID,
-		FinishReason:     "stop",
-		StopReason:       "stop",
-		Endpoint:         remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
-		Transport:        "remote",
-		EffectiveSession: SessionModeFresh,
-		ToolCalls:        remoteResult.ToolCalls,
+		Text:                  remoteResult.Text,
+		ThoughtText:           remoteResult.ThoughtText,
+		Model:                 valueOr(strings.TrimSpace(model), "lingma"),
+		InputTokens:           remoteResult.InputTokens,
+		OutputTokens:          remoteResult.OutputTokens,
+		InputTokensEstimated:  remoteResult.InputTokensEstimated,
+		OutputTokensEstimated: remoteResult.OutputTokensEstimated,
+		CachedTokens:          remoteResult.CachedTokens,
+		ReasoningTokens:       remoteResult.ReasoningTokens,
+		SessionID:             "",
+		RequestID:             remoteResult.RequestID,
+		FinishReason:          "stop",
+		StopReason:            "stop",
+		Endpoint:              remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
+		Transport:             "remote",
+		EffectiveSession:      SessionModeFresh,
+		ToolCalls:             remoteResult.ToolCalls,
 	}
-	if emulateTools {
-		s.applyToolEmulation(ctx, req, prompt, result, onDelta, func(hintPrompt string) (string, int, error) {
-			retryResult, err := client.Chat(ctx, remote.ChatRequest{
-				Model:           model,
-				Prompt:          hintPrompt,
-				Messages:        remoteMessagesForChat(req, hintPrompt, emulateTools),
-				Images:          remoteImagesFromRequest(req),
-				Stream:          false,
-				Temperature:     req.Temperature,
-				ReasoningEffort: req.ReasoningEffort,
-				Tools:           req.Tools,
-				ToolChoice:      req.ToolChoice,
-			}, nil)
-			if err != nil {
-				return "", 0, err
-			}
-			if len(retryResult.ToolCalls) > 0 {
-				result.Text = retryResult.Text
-				result.ToolCalls = retryResult.ToolCalls
-				result.OutputTokens = retryResult.OutputTokens
-				return "", 0, nil
-			}
-			return retryResult.Text, retryResult.OutputTokens, nil
-		})
+	if !emitted && onDelta != nil && result.Text != "" {
+		onDelta(StreamEvent{Type: StreamEventText, Delta: result.Text})
+		emitted = true
 	}
 	return result, emitted, nil
+}
+
+func looksLikeToolSyntax(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if strings.Contains(lower, "```json action") || strings.Contains(lower, "```action") || strings.Contains(lower, "``` action") {
+		return true
+	}
+	return (strings.HasPrefix(lower, "{") || strings.Contains(lower, "```json")) &&
+		(strings.Contains(lower, `"tool"`) || strings.Contains(lower, `"function"`) ||
+			(strings.Contains(lower, `"name"`) && (strings.Contains(lower, `"arguments"`) || strings.Contains(lower, `"parameters"`))))
+}
+
+func normalizeRemoteToolResult(req ChatRequest, result *remote.ChatResult) error {
+	if len(result.ToolCalls) > 0 {
+		calls, err := toolemulation.NormalizeToolCalls(result.ToolCalls, req.Tools, req.ToolChoice, req.System)
+		if err != nil {
+			return err
+		}
+		result.ToolCalls = calls
+	} else {
+		calls, remaining, err := toolemulation.ParseActionBlocksWithContext(result.Text, req.Tools, req.ToolChoice, req.System, toolemulation.Config{})
+		if err != nil {
+			return err
+		}
+		if len(calls) > 0 {
+			result.ToolCalls, result.Text = calls, remaining
+		} else if looksLikeToolSyntax(result.Text) {
+			return errors.New("unrecognized tool action; use the advertised tool name and JSON arguments")
+		}
+	}
+	if len(result.ToolCalls) == 0 && (req.ToolChoice.Mode == "tool" || req.ToolChoice.Mode == "any") {
+		return errors.New("tool_choice requires a valid tool call")
+	}
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && len(result.ToolCalls) > 1 {
+		return errors.New("parallel_tool_calls=false permits only one tool call")
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		message := req.Messages[i]
+		if message.Role != "tool" {
+			if message.Role == "user" {
+				break
+			}
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(message.Text))
+		if !strings.HasPrefix(lower, "error") && !strings.Contains(lower, "exception:") {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			for _, previous := range req.Messages[j].ToolCalls {
+				if previous.ID != message.ToolCallID {
+					continue
+				}
+				oldArgs, _ := json.Marshal(previous.Arguments)
+				for _, current := range result.ToolCalls {
+					args, _ := json.Marshal(current.Arguments)
+					if current.Name == previous.Name && string(args) == string(oldArgs) {
+						return errors.New("identical failed tool call; correct the arguments using the last tool error")
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func shouldEmulateRemoteTools(req ChatRequest) bool {
@@ -549,7 +753,19 @@ func remoteMessagesForChat(req ChatRequest, prompt string, emulateTools bool) []
 			return []remote.Message{{Role: "user", Content: prompt}}
 		}
 	}
-	return remoteMessagesFromRequest(req)
+	messages := remoteMessagesFromRequest(req)
+	if shouldEmulateRemoteTools(req) {
+		hint := "Use native function calls for the advertised tools. Preserve tool_call_id associations and use existing tool results. Do not repeat a failed call unchanged or claim an action succeeded without its tool result."
+		if len(req.Tools) == 1 && strings.EqualFold(req.Tools[0].Name, "run_code") {
+			hint += " Only run_code is callable directly. Call other tools inside its code using await tools.NAME(args), and print results with console.log. The code is an async function body: use await import() for modules; require() and static import declarations are unavailable."
+		}
+		if len(messages) > 0 && messages[0].Role == "system" {
+			messages[0].Content += "\n\n" + hint
+		} else {
+			messages = append([]remote.Message{{Role: "system", Content: hint}}, messages...)
+		}
+	}
+	return messages
 }
 
 func remoteMessagesFromRequest(req ChatRequest) []remote.Message {
@@ -563,7 +779,7 @@ func remoteMessagesFromRequest(req ChatRequest) []remote.Message {
 			continue
 		}
 		content := strings.TrimSpace(message.Text)
-		if content == "" && len(message.Images) == 0 && len(message.ToolCalls) == 0 {
+		if content == "" && len(message.Images) == 0 && len(message.ToolCalls) == 0 && !(role == "tool" && message.ToolCallID != "") {
 			continue
 		}
 		out = append(out, remote.Message{
@@ -697,6 +913,9 @@ func shouldRetryRemoteNativeTool(req ChatRequest, text string) bool {
 		return false
 	}
 	trimmed := strings.TrimSpace(text)
+	if looksLikeToolSyntax(trimmed) {
+		return true
+	}
 	if trimmed == "" || len([]rune(trimmed)) > 180 {
 		return false
 	}
@@ -720,11 +939,13 @@ func shouldRetryRemoteNativeTool(req ChatRequest, text string) bool {
 		strings.Contains(trimmed, "：\n") ||
 		strings.Contains(lower, "use ") ||
 		strings.Contains(lower, "call ") ||
-		strings.Contains(trimmed, "工具")
+		strings.Contains(trimmed, "工具") ||
+		strings.HasPrefix(lower, "let me ") || strings.HasPrefix(lower, "i will ") ||
+		strings.HasPrefix(trimmed, "让我") || strings.HasPrefix(trimmed, "我将") || strings.HasPrefix(trimmed, "我来")
 }
 
 func (s *Service) remoteAttemptModels(ctx context.Context, primary string) []string {
-	primary = normalizeModelForBackend(BackendRemote, primary)
+	primary = s.resolveRemoteModelID(primary)
 	models := []string{primary}
 	if !s.cfg.RemoteFallbackEnabled {
 		return models
@@ -757,6 +978,20 @@ func (s *Service) remoteAttemptModels(ctx context.Context, primary string) []str
 		models = append(models, model)
 	}
 	return models
+}
+
+func (s *Service) resolveRemoteModelID(model string) string {
+	model = strings.TrimSpace(model)
+	s.mu.Lock()
+	resolved := s.modelMap[model]
+	if resolved == "" {
+		resolved = s.modelMap[strings.ToLower(model)]
+	}
+	s.mu.Unlock()
+	if resolved != "" {
+		return resolved
+	}
+	return normalizeModelForBackend(BackendRemote, model)
 }
 
 func (s *Service) remoteFallbackModels() []string {
@@ -839,6 +1074,10 @@ func (s *Service) probeRemoteModel(ctx context.Context, model string) bool {
 }
 
 func isRemoteFallbackError(err error) bool {
+	var upstream *remote.UpstreamError
+	if errors.As(err, &upstream) {
+		return upstream.StatusCode == 429 || upstream.StatusCode >= 500
+	}
 	if err == nil {
 		return false
 	}
@@ -850,7 +1089,6 @@ func isRemoteFallbackError(err error) bool {
 		strings.Contains(msg, "client.timeout") ||
 		strings.Contains(msg, "timeout awaiting response") ||
 		strings.Contains(msg, "remote chat status 5") ||
-		strings.Contains(msg, "remote chat status 429") ||
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "unexpected eof")
 }
@@ -984,12 +1222,18 @@ func (s *Service) remoteClientLocked() *remote.Client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.remoteClient == nil {
+		retries := *s.cfg.RemoteRetryCount
+		if retries == 0 {
+			retries = -1
+		}
 		s.remoteClient = remote.New(remote.Config{
-			BaseURL:     s.cfg.RemoteBaseURL,
-			AuthFile:    s.cfg.RemoteAuthFile,
-			ProxyURL:    s.cfg.RemoteProxyURL,
-			CosyVersion: s.cfg.RemoteVersion,
-			Timeout:     s.cfg.Timeout,
+			MaxRetries:     retries,
+			RetryBaseDelay: time.Duration(s.cfg.RemoteRetryBaseDelayMS) * time.Millisecond,
+			BaseURL:        s.cfg.RemoteBaseURL,
+			AuthFile:       s.cfg.RemoteAuthFile,
+			ProxyURL:       s.cfg.RemoteProxyURL,
+			CosyVersion:    s.cfg.RemoteVersion,
+			Timeout:        s.cfg.Timeout,
 		})
 	}
 	return s.remoteClient
@@ -1084,23 +1328,28 @@ func (s *Service) buildChatResult(
 	effectiveMode SessionMode,
 ) *ChatResult {
 	endpoint := s.currentPipePath()
+	estimator := &utils.TokenEstimator{}
 	return &ChatResult{
-		Text:             runResult.AssistantText,
-		ThoughtText:      runResult.ThoughtText,
-		Model:            valueOr(strings.TrimSpace(req.Model), "lingma"),
-		InputTokens:      estimateTokens(prompt),
-		OutputTokens:     estimateTokens(runResult.AssistantText),
-		SessionID:        sessionID,
-		RequestID:        requestID,
-		FinishReason:     nestedString(runResult.FinishData, "reason"),
-		StopReason:       nestedString(runResult.PromptResult, "stopReason"),
-		UsedTokens:       int(nestedInt64(runResult.ContextUsage, "usedTokens")),
-		LimitTokens:      int(nestedInt64(runResult.ContextUsage, "limitTokens")),
-		ThinkingDuration: runResult.ThinkingDuration,
-		PipePath:         endpoint,
-		Endpoint:         endpoint,
-		Transport:        string(s.currentTransport()),
-		EffectiveSession: effectiveMode,
+		Text:                  runResult.AssistantText,
+		ThoughtText:           runResult.ThoughtText,
+		Model:                 valueOr(strings.TrimSpace(req.Model), "lingma"),
+		InputTokens:           estimator.EstimateTokens(prompt),
+		OutputTokens:          estimator.EstimateTokensOrZero(runResult.AssistantText + runResult.ThoughtText),
+		InputTokensEstimated:  true,
+		OutputTokensEstimated: true,
+		ReasoningTokens:       estimator.EstimateTokensOrZero(runResult.ThoughtText),
+		SessionID:             sessionID,
+		RequestID:             requestID,
+		FinishReason:          nestedString(runResult.FinishData, "reason"),
+		StopReason:            nestedString(runResult.PromptResult, "stopReason"),
+		ContextUsageKnown:     runResult.ContextUsage["usedTokens"] != nil,
+		UsedTokens:            int(nestedInt64(runResult.ContextUsage, "usedTokens")),
+		LimitTokens:           int(nestedInt64(runResult.ContextUsage, "limitTokens")),
+		ThinkingDuration:      runResult.ThinkingDuration,
+		PipePath:              endpoint,
+		Endpoint:              endpoint,
+		Transport:             string(s.currentTransport()),
+		EffectiveSession:      effectiveMode,
 	}
 }
 
@@ -1531,6 +1780,12 @@ func filteredMessages(messages []ChatMessage) []ChatMessage {
 	for _, message := range messages {
 		role := strings.ToLower(strings.TrimSpace(message.Role))
 		text := strings.TrimSpace(message.Text)
+		if role == "assistant" {
+			text = toolemulation.AssistantToolCallsToText(text, message.ToolCalls)
+		}
+		if role == "tool" && text == "" && message.ToolCallID != "" {
+			text = "(empty tool output)"
+		}
 		if text == "" {
 			continue
 		}
@@ -1559,55 +1814,74 @@ func reasoningSystemHint(effort string) string {
 	}
 }
 
+// estimateTokens approximates a tokenizer without shipping one: CJK and other
+// full-width scripts cost roughly one token per character while ASCII costs
+// roughly one token per four characters. It replaces a flat rune/N heuristic
+// that under-counted Chinese prompts by a factor of two or more.
 func estimateTokens(text string) int {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return 1
 	}
-	return max(1, (len([]rune(text))+2)/3)
+	cjk := 0
+	ascii := 0
+	for _, r := range text {
+		if isWideRune(r) {
+			cjk++
+			continue
+		}
+		ascii++
+	}
+	keep := float64(cjk)*0.7 + float64(ascii)*0.25
+	return max(1, 1+int(keep))
+}
+
+// estimateTokensOrZero estimates tokens but reports empty text as zero.
+func estimateTokensOrZero(text string) int {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+	return estimateTokens(text)
+}
+
+// isWideRune reports whether a rune belongs to a script that byte-pair
+// tokenizers usually emit as its own token.
+func isWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x11FF) ||
+		(r >= 0x2E80 && r <= 0x303F) ||
+		(r >= 0x3040 && r <= 0x30FF) ||
+		(r >= 0x3130 && r <= 0x318F) ||
+		(r >= 0x3400 && r <= 0x4DBF) ||
+		(r >= 0x4E00 && r <= 0x9FFF) ||
+		(r >= 0xA960 && r <= 0xA97F) ||
+		(r >= 0xAC00 && r <= 0xD7AF) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0xFF00 && r <= 0xFFEF) ||
+		(r >= 0x20000 && r <= 0x2FA1F)
 }
 
 func extractModels(raw any) []Model {
-	seen := make(map[string]Model)
-	var walk func(scene string, value any)
-	walk = func(scene string, value any) {
-		switch typed := value.(type) {
-		case map[string]any:
-			id := firstString(typed, "id", "modelId", "key")
-			name := firstString(typed, "name", "label", "displayName", "title")
-			currentScene := scene
-			if currentScene == "" {
-				currentScene = firstString(typed, "scene", "sceneId", "category")
-			}
-			if id != "" && (name != "" || likelyModelID(id)) {
-				if name == "" {
-					name = id
-				}
-				seen[name] = Model{ID: name, Name: name, Scene: currentScene, InternalID: id}
-			}
-			for key, child := range typed {
-				nextScene := currentScene
-				if nextScene == "" || isSceneKey(key) {
-					nextScene = key
-				}
-				walk(nextScene, child)
-			}
-		case []any:
-			for _, item := range typed {
-				walk(scene, item)
-			}
-		}
+	parsed := modelmeta.Parse(raw)
+	names := make(map[string]int, len(parsed))
+	for _, m := range parsed {
+		names[m.Name]++
 	}
-	walk("", raw)
-
-	models := make([]Model, 0, len(seen))
-	for _, model := range seen {
-		models = append(models, model)
+	models := make([]Model, 0, len(parsed))
+	for _, m := range parsed {
+		id := m.Name
+		if names[id] > 1 {
+			id = m.ID
+		}
+		models = append(models, Model{ID: id, Name: m.Name, Scene: m.Scene, InternalID: m.ID, ContextWindow: m.ContextWindow, MaxContextLength: m.MaxContextLength, ContextOptions: m.ContextOptions, MaxInputTokens: m.MaxInputTokens, SupportsVision: m.SupportsVision, SupportsVisionKnown: m.SupportsVisionKnown})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models
 }
 
+// ModelContextWindow returns a compatibility hint for recognized aliases.
+func ModelContextWindow(ids ...string) int   { return modelmeta.ContextWindow(ids...) }
+func modelContextWindow(ids ...string) int   { return ModelContextWindow(ids...) }
+func modelSupportsVision(ids ...string) bool { return modelmeta.Vision(ids...) }
 func likelyModelID(id string) bool {
 	lowered := strings.ToLower(id)
 	return strings.Contains(lowered, "qwen") || strings.Contains(lowered, "model") || strings.Contains(lowered, "auto") || strings.Contains(lowered, "coder")

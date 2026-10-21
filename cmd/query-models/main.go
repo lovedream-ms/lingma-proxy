@@ -8,13 +8,14 @@ import (
 	"time"
 
 	"lingma-ipc-proxy/internal/lingmaipc"
+	"lingma-ipc-proxy/internal/modelmeta"
 )
 
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 使用自动发现的传输方式
+	// Discover the active IPC transport.
 	opts, err := lingmaipc.ResolveDialOptions(lingmaipc.TransportAuto, "", "")
 	if err != nil {
 		log.Fatalf("Failed to resolve dial options: %v", err)
@@ -32,7 +33,7 @@ func main() {
 	}
 	defer client.Close()
 
-	// 初始化
+	// Initialize the IPC client.
 	if err := client.Request(ctx, "initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{},
@@ -43,109 +44,24 @@ func main() {
 	fmt.Println("Initialized successfully")
 	fmt.Println()
 
-	// 查询模型
+	// Query the current IPC catalogue.
 	var raw any
 	if err := client.Request(ctx, "config/queryModels", map[string]any{}, &raw); err != nil {
 		log.Fatalf("Failed to query models: %v", err)
 	}
 
-	// 打印原始结果
+	// Print the original response for diagnostics.
 	fmt.Println("=== Raw IPC Response ===")
 	rawJSON, _ := json.MarshalIndent(raw, "", "  ")
 	fmt.Println(string(rawJSON))
 	fmt.Println()
 
-	// 提取并打印模型列表
+	// Share the exact metadata parser used by the HTTP server.
 	fmt.Println("=== Extracted Models ===")
-	models := extractModels(raw)
+	models := modelmeta.Parse(raw)
 	for _, m := range models {
-		fmt.Printf("ID: %s, Name: %s, Scene: %s\n", m.ID, m.Name, m.Scene)
+		fmt.Printf("ID: %s, Name: %s, Scene: %s, ContextWindow: %d, MaxInputTokens: %d, SupportsText: true, SupportsVision: %t, VisionMetadataProvided: %t\n",
+			m.ID, m.Name, m.Scene, m.ContextWindow, m.MaxInputTokens, m.SupportsVision, m.SupportsVisionKnown)
 	}
-}
-
-type Model struct {
-	ID    string
-	Name  string
-	Scene string
-}
-
-func extractModels(raw any) []Model {
-	seen := make(map[string]Model)
-	var walk func(scene string, value any)
-	walk = func(scene string, value any) {
-		switch typed := value.(type) {
-		case map[string]any:
-			id := firstString(typed, "id", "modelId", "key")
-			name := firstString(typed, "name", "label", "displayName", "title")
-			currentScene := scene
-			if currentScene == "" {
-				currentScene = firstString(typed, "scene", "sceneId", "category")
-			}
-			if id != "" && (name != "" || likelyModelID(id)) {
-				if name == "" {
-					name = id
-				}
-				seen[id] = Model{ID: id, Name: name, Scene: currentScene}
-			}
-			for key, child := range typed {
-				nextScene := currentScene
-				if nextScene == "" || isSceneKey(key) {
-					nextScene = key
-				}
-				walk(nextScene, child)
-			}
-		case []any:
-			for _, item := range typed {
-				walk(scene, item)
-			}
-		}
-	}
-	walk("", raw)
-
-	models := make([]Model, 0, len(seen))
-	for _, model := range seen {
-		models = append(models, model)
-	}
-	return models
-}
-
-func likelyModelID(id string) bool {
-	lowered := id
-	return contains(lowered, "qwen") || contains(lowered, "model") || contains(lowered, "auto") || contains(lowered, "coder")
-}
-
-func isSceneKey(key string) bool {
-	switch key {
-	case "assistant", "chat", "developer", "inline", "quest":
-		return true
-	default:
-		return false
-	}
-}
-
-func firstString(m map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, ok := m[key]; ok {
-			switch typed := value.(type) {
-			case string:
-				if typed != "" {
-					return typed
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	fmt.Printf("Total enabled models: %d\n", len(models))
 }

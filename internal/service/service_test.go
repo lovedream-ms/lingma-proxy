@@ -7,8 +7,37 @@ import (
 	"testing"
 	"time"
 
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
+
+func TestVerify429AndQuotaCanUseConfiguredModelFallback(t *testing.T) {
+	for _, err := range []*remote.UpstreamError{
+		{StatusCode: 429}, {StatusCode: 429, QuotaExhausted: true}, {StatusCode: 503, QuotaExhausted: true},
+	} {
+		if !isRemoteFallbackError(err) {
+			t.Fatalf("rate/quota error incorrectly blocks configured model fallback: %v", err)
+		}
+	}
+	if !isRemoteFallbackError(&remote.UpstreamError{StatusCode: 503}) {
+		t.Fatal("unrelated service-unavailable fallback disabled")
+	}
+}
+
+func TestVerifyContextFallbackDoesNotDoubleCountCacheOrReplaceKnownZero(t *testing.T) {
+	svc := New(Config{})
+	svc.modelLimits = map[string]int{"example": 200000}
+	result := &ChatResult{Model: "example", InputTokens: 1200, OutputTokens: 40, CachedTokens: 1000}
+	svc.completeContextUsage(result)
+	if result.UsedTokens != 1240 || result.LimitTokens != 200000 || !result.ContextUsageEstimated {
+		t.Fatalf("invalid fallback occupancy: %+v", result)
+	}
+	result = &ChatResult{Model: "example", InputTokens: 1200, OutputTokens: 40, ContextUsageKnown: true}
+	svc.completeContextUsage(result)
+	if result.UsedTokens != 0 || result.ContextUsageEstimated {
+		t.Fatalf("known upstream zero replaced: %+v", result)
+	}
+}
 
 func TestIsRecoverableIPCError(t *testing.T) {
 	cases := []error{
@@ -169,7 +198,7 @@ func TestRemoteMessagesForChatUsesPromptWhenToolEmulationEnabled(t *testing.T) {
 	}
 
 	plain := remoteMessagesForChat(req, "ignored", false)
-	if len(plain) != 2 || plain[0].Role != "system" || plain[1].Content != "查看项目结构" {
+	if len(plain) != 2 || plain[0].Role != "system" || !strings.Contains(plain[0].Content, "original system") || !strings.Contains(plain[0].Content, "native function calls") || plain[1].Content != "查看项目结构" {
 		t.Fatalf("expected structured messages without emulation, got %#v", plain)
 	}
 }

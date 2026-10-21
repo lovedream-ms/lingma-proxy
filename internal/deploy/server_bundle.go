@@ -14,6 +14,7 @@ import (
 )
 
 type ServerBundleOptions struct {
+	RuntimeConfig *service.Config
 	AuthFile      string
 	OutputPath    string
 	PickPolicy    remote.CredentialPickPolicy
@@ -70,7 +71,7 @@ func WriteServerBundle(options ServerBundleOptions) (ServerBundleResult, error) 
 		return result, err
 	}
 
-	configJSON, err := marshalJSON(map[string]any{
+	fileCfg := map[string]any{
 		"host":                    options.Host,
 		"port":                    options.Port,
 		"backend":                 string(service.BackendRemote),
@@ -83,7 +84,19 @@ func WriteServerBundle(options ServerBundleOptions) (ServerBundleResult, error) 
 		"timeout":                 0,
 		"remote_fallback_enabled": true,
 		"remote_fallback_models":  service.DefaultRemoteFallbackModels(),
-	})
+	}
+	if options.RuntimeConfig != nil {
+		cfg := service.NormalizeRuntimeSettings(*options.RuntimeConfig)
+		fileCfg["max_concurrent_requests"] = cfg.MaxConcurrentRequests
+		fileCfg["remote_retry_count"] = cfg.RemoteRetryCount
+		fileCfg["remote_retry_base_delay_ms"] = cfg.RemoteRetryBaseDelayMS
+		fileCfg["aggregate_tool_stream"] = cfg.AggregateToolStream
+		fileCfg["timeout"] = int(cfg.Timeout.Seconds())
+		fileCfg["warmup_timeout"] = int(cfg.WarmupTimeout.Seconds())
+		fileCfg["remote_fallback_enabled"] = cfg.RemoteFallbackEnabled
+		fileCfg["remote_fallback_models"] = cfg.RemoteFallbackModels
+	}
+	configJSON, err := marshalJSON(fileCfg)
 	if err != nil {
 		return result, err
 	}

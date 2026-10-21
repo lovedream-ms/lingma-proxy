@@ -133,6 +133,8 @@ func TestDefaultImageURISchemeFallsBackToLingma(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", home)
+	t.Setenv("LOCALAPPDATA", home)
 	t.Setenv("LINGMA_SHARED_CLIENT_INFO", "")
 	t.Setenv("LINGMA_IPC_PIPE", "")
 	t.Setenv("LINGMA_IPC_SOCKET", "")

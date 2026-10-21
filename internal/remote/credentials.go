@@ -24,6 +24,7 @@ type Credential struct {
 	MachineID       string
 	Source          string
 	TokenExpireTime int64
+	Desktop         *DesktopCredentialContext
 }
 
 type CredentialPickPolicy string
@@ -51,10 +52,11 @@ type storedCredentialFile struct {
 	Source          string `json:"source"`
 	TokenExpireTime string `json:"token_expire_time"`
 	Auth            struct {
-		CosyKey         string `json:"cosy_key"`
-		EncryptUserInfo string `json:"encrypt_user_info"`
-		UserID          string `json:"user_id"`
-		MachineID       string `json:"machine_id"`
+		CosyKey         string                    `json:"cosy_key"`
+		EncryptUserInfo string                    `json:"encrypt_user_info"`
+		UserID          string                    `json:"user_id"`
+		MachineID       string                    `json:"machine_id"`
+		Desktop         *DesktopCredentialContext `json:"qodercn,omitempty"`
 	} `json:"auth"`
 }
 
@@ -62,7 +64,40 @@ func LoadCredential(authFile string) (Credential, error) {
 	if path := strings.TrimSpace(authFile); path != "" {
 		return loadCredentialFile(expandHome(path))
 	}
+	if cred, found, err := loadDesktopCredential(); found {
+		return cred, err
+	}
 	return importLingmaCacheCredential()
+}
+
+// CredentialCompatibilityWarning explains why a signed-in modern client can
+// expose a different catalogue from the legacy COSY credential importer.
+func CredentialCompatibilityWarning(authFile string) string {
+	if strings.TrimSpace(authFile) != "" {
+		return ""
+	}
+	if _, found, err := loadDesktopCredential(); found {
+		if err == nil {
+			return ""
+		}
+		return "新版 QoderCN 登录读取失败：" + err.Error()
+	}
+	for _, cacheDir := range candidateLingmaCacheDirs() {
+		if _, err := os.Stat(filepath.Join(cacheDir, "cache", "user")); !os.IsNotExist(err) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(cacheDir, "cache", "status.json"))
+		if err != nil {
+			continue
+		}
+		var status struct {
+			LoggedIn bool `json:"logged_in"`
+		}
+		if json.Unmarshal(data, &status) == nil && status.LoggedIn {
+			return "检测到已登录的新版本 QoderCN，但该登录缓存未提供兼容 COSY 的凭据；远程模式可能仍使用其他旧版登录缓存，模型目录可能与 IPC 不同。可使用 IPC 查询当前客户端模型。"
+		}
+	}
+	return ""
 }
 
 func LoadCredentialByPolicy(authFile string, policy CredentialPickPolicy) (Credential, error) {
@@ -108,6 +143,7 @@ func SaveCredentialFile(cred Credential, path string) error {
 	stored.Auth.EncryptUserInfo = cred.EncryptUserInfo
 	stored.Auth.UserID = cred.UserID
 	stored.Auth.MachineID = cred.MachineID
+	stored.Auth.Desktop = cred.Desktop
 
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
@@ -178,6 +214,7 @@ func loadCredentialFile(path string) (Credential, error) {
 		MachineID:       stored.Auth.MachineID,
 		Source:          valueOr(stored.Source, path),
 		TokenExpireTime: parseExpire(stored.TokenExpireTime),
+		Desktop:         stored.Auth.Desktop,
 	}
 	return cred, validateCredential(cred)
 }

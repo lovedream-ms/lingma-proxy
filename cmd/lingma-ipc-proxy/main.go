@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"lingma-ipc-proxy/desktop/autostart"
 	"lingma-ipc-proxy/internal/deploy"
 	"lingma-ipc-proxy/internal/httpapi"
 	"lingma-ipc-proxy/internal/lingmaipc"
@@ -30,6 +31,8 @@ var utilityOptions struct {
 }
 
 type fileConfig struct {
+	service.RuntimeSettingsFile
+	WarmupTimeoutSeconds  int      `json:"warmup_timeout"`
 	Host                  string   `json:"host"`
 	Port                  int      `json:"port"`
 	Backend               string   `json:"backend"`
@@ -49,6 +52,7 @@ type fileConfig struct {
 	TimeoutSeconds        int      `json:"timeout"`
 	RemoteFallbackEnabled *bool    `json:"remote_fallback_enabled"`
 	RemoteFallbackModels  []string `json:"remote_fallback_models"`
+	AutoStartOnBoot       bool     `json:"auto_start_on_boot"`
 }
 
 func main() {
@@ -56,6 +60,12 @@ func main() {
 	if handleUtilityCommands(cfg) {
 		return
 	}
+
+	// 添加自启动逻辑
+	if cfg.AutoStartOnBoot {
+		enableAutoStart()
+	}
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	svc := service.New(cfg)
@@ -113,6 +123,7 @@ func loadConfig() (service.Config, string) {
 		ShellType:             defaultShellType(),
 		SessionMode:           service.SessionModeAuto,
 		Timeout:               0,
+		WarmupTimeout:         30 * time.Second,
 		RemoteFallbackEnabled: true,
 		RemoteFallbackModels:  service.DefaultRemoteFallbackModels(),
 	}
@@ -128,6 +139,12 @@ func loadConfig() (service.Config, string) {
 
 	overlayEnvConfig(&cfg)
 
+	cfg = service.NormalizeRuntimeSettings(cfg)
+	maxConcurrent := flag.Int("max-concurrent", cfg.MaxConcurrentRequests, "Maximum concurrent requests: 1-16")
+	remoteRetryCount := flag.Int("remote-retry-count", *cfg.RemoteRetryCount, "Retries for transient remote 429: 0 disables retries")
+	remoteRetryDelay := flag.Int("remote-retry-delay-ms", cfg.RemoteRetryBaseDelayMS, "Initial remote retry delay in milliseconds")
+	aggregateToolStream := flag.Bool("aggregate-tool-stream", *cfg.AggregateToolStream, "Buffer tool streams until completion")
+	warmupTimeout := flag.Int("warmup-timeout", int(cfg.WarmupTimeout/time.Second), "Model discovery timeout in seconds")
 	host := flag.String("host", cfg.Host, "Listen host")
 	port := flag.Int("port", cfg.Port, "Listen port")
 	transport := flag.String("transport", string(cfg.Transport), "Lingma/QoderCN transport: auto, pipe, websocket")
@@ -151,7 +168,16 @@ func loadConfig() (service.Config, string) {
 	remoteAuthPick := flag.String("remote-auth-pick", "auto", "Remote login cache pick policy for export: auto, newest, or longest")
 	sessionMode := flag.String("session-mode", string(cfg.SessionMode), "Session mode: auto, fresh, reuse")
 	config := flag.String("config", valueOr(configPath, filepath.Join(currentDir(), "lingma-proxy.json")), "Path to JSON config file")
+	autoStartOnBoot := flag.Bool("auto-start-on-boot", cfg.AutoStartOnBoot, "Enable auto-start on system boot")
 	flag.Parse()
+	cfg.MaxConcurrentRequests = *maxConcurrent
+	cfg.RemoteRetryCount = remoteRetryCount
+	cfg.RemoteRetryBaseDelayMS = *remoteRetryDelay
+	cfg.AggregateToolStream = aggregateToolStream
+	cfg.WarmupTimeout = time.Duration(*warmupTimeout) * time.Second
+	if err := cfg.ValidateRuntimeSettings(); err != nil {
+		log.Fatal(err)
+	}
 
 	parsedSessionMode := parseSessionMode(*sessionMode)
 	parsedTransport := parseTransport(*transport)
@@ -176,6 +202,7 @@ func loadConfig() (service.Config, string) {
 	cfg.Timeout = time.Duration(*timeoutSeconds) * time.Second
 	cfg.RemoteFallbackEnabled = *remoteFallbackEnabled
 	cfg.RemoteFallbackModels = splitCSV(*remoteFallbackModels)
+	cfg.AutoStartOnBoot = *autoStartOnBoot
 	utilityOptions.exportRemoteAuth = strings.TrimSpace(*exportRemoteAuth)
 	utilityOptions.exportServerBundle = strings.TrimSpace(*exportServerBundle)
 	utilityOptions.remoteAuthPick = strings.TrimSpace(*remoteAuthPick)
@@ -215,6 +242,7 @@ func handleUtilityCommands(cfg service.Config) bool {
 			host = "0.0.0.0"
 		}
 		result, err := deploy.WriteServerBundle(deploy.ServerBundleOptions{
+			RuntimeConfig: &cfg,
 			AuthFile:      cfg.RemoteAuthFile,
 			OutputPath:    utilityOptions.exportServerBundle,
 			PickPolicy:    policy,
@@ -277,6 +305,10 @@ func readFileConfig(path string) (fileConfig, error) {
 }
 
 func overlayFileConfig(dst *service.Config, src fileConfig) {
+	src.RuntimeSettingsFile.Apply(dst)
+	if src.WarmupTimeoutSeconds > 0 {
+		dst.WarmupTimeout = time.Duration(src.WarmupTimeoutSeconds) * time.Second
+	}
 	if strings.TrimSpace(src.Host) != "" {
 		dst.Host = strings.TrimSpace(src.Host)
 	}
@@ -334,6 +366,8 @@ func overlayFileConfig(dst *service.Config, src fileConfig) {
 	if len(src.RemoteFallbackModels) > 0 {
 		dst.RemoteFallbackModels = cleanStringSlice(src.RemoteFallbackModels)
 	}
+	// 添加这一行来处理 AutoStartOnBoot
+	dst.AutoStartOnBoot = src.AutoStartOnBoot
 }
 
 func overlayEnvConfig(dst *service.Config) {
@@ -508,4 +542,19 @@ func defaultShellType() string {
 		return "zsh"
 	}
 	return "bash"
+}
+
+func enableAutoStart() {
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Printf("Failed to get executable path for auto-start: %v", err)
+		return
+	}
+
+	starter := autostart.New("lingma-proxy", execPath)
+	if err := starter.Enable(); err != nil {
+		log.Printf("Failed to enable auto-start: %v", err)
+	} else {
+		log.Printf("Auto-start enabled successfully")
+	}
 }

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -11,9 +12,148 @@ import (
 	"testing"
 	"time"
 
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
+
+func TestVerifyDiscoveryUsesUpstreamModelMetadata(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("discovery attempted a non-GET request: %s", r.Method)
+			http.Error(w, "discovery must not send chat probes", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"chat":[{"key":"kmodel","display_name":"Kimi-K2.6","context_window":32768,"supports_vision":false,"enable":true},{"key":"future-vision","display_name":"Future Vision","maxInputTokens":180000,"contextConfig":{"200K":{"isDefault":true,"tokenCount":200000},"400K":{"tokenCount":400000}},"supports_vision":true,"enable":true},{"key":"future-text","display_name":"Future Text","enable":true}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	auth := filepath.Join(t.TempDir(), "auth.json")
+	if err := remote.SaveCredentialFile(remote.Credential{CosyKey: "test", EncryptUserInfo: "test", UserID: "test", MachineID: "test"}, auth); err != nil {
+		t.Fatal(err)
+	}
+	svc := service.New(service.Config{Backend: service.BackendRemote, RemoteBaseURL: upstream.URL, RemoteAuthFile: auth, Model: "kmodel"})
+	t.Cleanup(func() { _ = svc.Close() })
+	server := NewServer("", svc)
+	for _, endpoint := range []struct{ path, list, id string }{
+		{"/models", "data", "id"},
+		{"/v1/models", "data", "id"},
+		{"/api/v1/models", "models", "id"},
+		{"/api/tags", "models", "name"},
+	} {
+		t.Run(endpoint.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			server.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, endpoint.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			var payload struct {
+				Data   []map[string]any `json:"data"`
+				Models []map[string]any `json:"models"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			models := payload.Data
+			if endpoint.list == "models" {
+				models = payload.Models
+			}
+			if len(models) != 3 {
+				t.Fatalf("expected exactly upstream's 3 models, got %d", len(models))
+			}
+			for _, model := range models {
+				id := model[endpoint.id].(string)
+				vision := id == "future-vision"
+				if model["supports_vision"] != vision || model["supports_text"] != true {
+					t.Fatalf("%s capability fields = %#v", id, model)
+				}
+				modalities, ok := model["input_modalities"].([]any)
+				if !ok || len(modalities) == 0 || modalities[0] != "text" || (len(modalities) == 2) != vision {
+					t.Fatalf("%s modalities = %#v", id, model["input_modalities"])
+				}
+				wantContext := map[string]float64{"kmodel": 32768, "future-vision": 200000, "future-text": 0}[id]
+				contextKey := "context_window"
+				if endpoint.path == "/api/v1/models" {
+					contextKey = "max_context_length"
+					if vision {
+						wantContext = 400000
+					}
+				}
+				if model[contextKey] != wantContext {
+					t.Fatalf("%s context = %#v, want %v", id, model[contextKey], wantContext)
+				}
+				if endpoint.path == "/v1/models" || endpoint.path == "/models" {
+					maximum := wantContext
+					if vision {
+						maximum = 400000
+					}
+					if model["max_context_length"] != maximum || model["contextWindow"] != maximum {
+						t.Fatalf("maximum context lost: %#v", model)
+					}
+					caps, _ := model["capabilities"].(map[string]any)
+					if caps["vision"] != vision {
+						t.Fatalf("capability lost: %#v", model)
+					}
+				}
+				if vision && model["max_input_tokens"] != float64(180000) {
+					t.Fatalf("%s input budget = %#v, want 180000 independently of 200000 context", id, model["max_input_tokens"])
+				}
+				if !vision {
+					if _, ok := model["max_input_tokens"]; ok {
+						t.Fatalf("%s advertises an unknown input budget", id)
+					}
+				}
+			}
+		})
+	}
+	for _, path := range []string{"/props", "/v1/props"} {
+		rec := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var props struct {
+			Settings struct {
+				Context int `json:"n_ctx"`
+			} `json:"default_generation_settings"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &props) != nil || props.Settings.Context != 32768 {
+			t.Fatalf("%s lost upstream context: %d %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestVerifyNewModelDisplayNameRoutesAfterWarmup(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"app":[{"key":"future-route","displayName":"Future Model","isVl":false}]}`))
+			return
+		}
+		var payload struct {
+			Model struct {
+				Key string `json:"key"`
+			} `json:"model_config"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Model.Key != "future-route" {
+			t.Errorf("display name not resolved to current routing ID: %q", payload.Model.Key)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	auth := filepath.Join(t.TempDir(), "credentials.json")
+	if err := remote.SaveCredentialFile(remote.Credential{CosyKey: "synthetic", EncryptUserInfo: "synthetic", UserID: "synthetic", MachineID: "synthetic"}, auth); err != nil {
+		t.Fatal(err)
+	}
+	svc := service.New(service.Config{Backend: service.BackendRemote, RemoteBaseURL: upstream.URL, RemoteAuthFile: auth})
+	defer svc.Close()
+	if err := svc.Warmup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer("", svc)
+	rec := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"Future Model","messages":[{"role":"user","content":"hello"}]}`)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"OK"`) {
+		t.Fatalf("new display-name request failed: %d", rec.Code)
+	}
+}
 
 func TestNormalizeOpenAIRequestCollectsSystemMessages(t *testing.T) {
 	req := openAIChatRequest{

@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 	"lingma-ipc-proxy/internal/toolemulation"
 	"lingma-ipc-proxy/internal/version"
@@ -57,25 +60,32 @@ type anthropicRequest struct {
 }
 
 type openAIChatRequest struct {
-	Model               string       `json:"model"`
-	Messages            []rawMessage `json:"messages"`
-	Stream              bool         `json:"stream,omitempty"`
-	MaxTokens           int          `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int          `json:"max_completion_tokens,omitempty"`
-	Tools               any          `json:"tools,omitempty"`
-	ToolChoice          any          `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool        `json:"parallel_tool_calls,omitempty"`
-	Temperature         *float64     `json:"temperature,omitempty"`
-	TopP                *float64     `json:"top_p,omitempty"`
-	Stop                any          `json:"stop,omitempty"`
-	PresencePenalty     float64      `json:"presence_penalty,omitempty"`
-	FrequencyPenalty    float64      `json:"frequency_penalty,omitempty"`
-	Logprobs            bool         `json:"logprobs,omitempty"`
-	TopLogprobs         int          `json:"top_logprobs,omitempty"`
-	ResponseFormat      any          `json:"response_format,omitempty"`
-	Seed                int          `json:"seed,omitempty"`
-	User                string       `json:"user,omitempty"`
-	ReasoningEffort     string       `json:"reasoning_effort,omitempty"`
+	Model               string         `json:"model"`
+	Messages            []rawMessage   `json:"messages"`
+	Stream              bool           `json:"stream,omitempty"`
+	MaxTokens           int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
+	Tools               any            `json:"tools,omitempty"`
+	ToolChoice          any            `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
+	Temperature         *float64       `json:"temperature,omitempty"`
+	TopP                *float64       `json:"top_p,omitempty"`
+	Stop                any            `json:"stop,omitempty"`
+	PresencePenalty     float64        `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    float64        `json:"frequency_penalty,omitempty"`
+	Logprobs            bool           `json:"logprobs,omitempty"`
+	TopLogprobs         int            `json:"top_logprobs,omitempty"`
+	ResponseFormat      any            `json:"response_format,omitempty"`
+	Seed                int            `json:"seed,omitempty"`
+	User                string         `json:"user,omitempty"`
+	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
+	StreamOptions       *streamOptions `json:"stream_options,omitempty"`
+}
+
+// streamOptions mirrors OpenAI's `stream_options` object. Clients set
+// include_usage to ask for a final chunk carrying token usage.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type openAIResponsesRequest struct {
@@ -104,11 +114,20 @@ type rawMessage struct {
 }
 
 type modelResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-	Name    string `json:"name,omitempty"`
+	ContextCapacity  int             `json:"contextWindow"`
+	ContextOptions   []int           `json:"context_options,omitempty"`
+	Capabilities     map[string]bool `json:"capabilities"`
+	ID               string          `json:"id"`
+	Object           string          `json:"object"`
+	Created          int64           `json:"created"`
+	OwnedBy          string          `json:"owned_by"`
+	Name             string          `json:"name,omitempty"`
+	ContextWindow    int             `json:"context_window"`
+	MaxContextLength int             `json:"max_context_length"`
+	MaxInputTokens   int             `json:"max_input_tokens,omitempty"`
+	SupportsText     bool            `json:"supports_text"`
+	SupportsVision   bool            `json:"supports_vision"`
+	InputModalities  []string        `json:"input_modalities"`
 }
 
 type debugRequestRecord struct {
@@ -141,7 +160,7 @@ type DebugAppLogRecord struct {
 func NewServer(addr string, svc *service.Service) *Server {
 	s := &Server{
 		svc: svc,
-		sem: make(chan struct{}, maxConcurrentRequests()),
+		sem: make(chan struct{}, svc.MaxConcurrentRequests()),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
@@ -156,6 +175,7 @@ func NewServer(addr string, svc *service.Service) *Server {
 	mux.HandleFunc("/api/logs", s.handleDebugLogs)
 	mux.HandleFunc("/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/v1/capabilities", s.handleCapabilities)
+	mux.HandleFunc("/models", s.handleModels)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/api/v1/models", s.handleLMStudioModels)
 	mux.HandleFunc("/api/tags", s.handleOllamaTags)
@@ -202,6 +222,7 @@ func (s *Server) SetDefaultModel(model string) {
 }
 
 func (s *Server) applyDefaultModel(req *service.ChatRequest) {
+	req.AggregateToolStream = s.svc.AggregateToolStream()
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.svc.DefaultModel()
 	}
@@ -365,7 +386,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
@@ -373,17 +394,42 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	for _, model := range models {
 		data = append(data, modelResponse{
-			ID:      model.ID,
-			Object:  "model",
-			Created: created,
-			OwnedBy: "lingma",
-			Name:    model.Name,
+			ID:               model.ID,
+			Object:           "model",
+			Created:          created,
+			OwnedBy:          "lingma",
+			Name:             model.Name,
+			ContextWindow:    model.ContextWindow,
+			MaxContextLength: modelMaximumContext(model),
+			ContextCapacity:  modelMaximumContext(model),
+			ContextOptions:   model.ContextOptions,
+			Capabilities:     map[string]bool{"vision": model.SupportsVision},
+			MaxInputTokens:   model.MaxInputTokens,
+			SupportsText:     true,
+			SupportsVision:   model.SupportsVision,
+			InputModalities:  modelInputModalities(model),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   data,
 	})
+}
+
+// modelMaximumContext advertises capacity separately from the default session window.
+func modelMaximumContext(model service.Model) int {
+	if model.MaxContextLength > model.ContextWindow {
+		return model.MaxContextLength
+	}
+	return model.ContextWindow
+}
+
+func modelInputModalities(model service.Model) []string {
+	modalities := []string{"text"}
+	if model.SupportsVision {
+		modalities = append(modalities, "image")
+	}
+	return modalities
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -421,13 +467,13 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"recommended_models": map[string]any{
 			"default":     "kmodel",
 			"agent_tools": []string{"kmodel", "MiniMax-M2.7", "Qwen3-Coder", "Qwen3.6-Plus"},
-			"vision":      []string{"Kimi-K2.6", "Qwen3-Max", "Qwen3.6-Plus", "MiniMax-M2.7", "Auto"},
+			"vision":      []string{"Kimi-K2.6", "Qwen3.6-Plus"},
 			"coding":      []string{"kmodel", "Qwen3-Coder", "MiniMax-M2.7"},
 		},
 		"model_metadata": map[string]any{
 			"Kimi-K2.6": map[string]any{
 				"context_window_tokens": 256000,
-				"modalities":            []string{"text", "image", "video"},
+				"modalities":            []string{"text", "image"},
 				"capabilities":          []string{"agent", "coding", "tool_use", "vision"},
 				"basis":                 "official_kimi_docs",
 				"source":                "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
@@ -458,12 +504,18 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			"openai_chat":        []string{"/v1/chat/completions", "/api/v1/chat/completions"},
 			"openai_responses":   []string{"/v1/responses", "/api/v1/responses"},
 			"anthropic_messages": "/v1/messages",
-			"models":             []string{"/v1/models", "/api/v1/models", "/api/tags"},
+			"models":             []string{"/models", "/v1/models", "/api/v1/models", "/api/tags"},
 			"capabilities":       []string{"/capabilities", "/v1/capabilities"},
 			"props":              []string{"/props", "/v1/props"},
 			"version":            "/version",
 		},
 	})
+}
+
+// modelContextWindow shares the catalogue compatibility hints for offline
+// props discovery. Unknown models have no advertised context limit.
+func modelContextWindow(ids ...string) int {
+	return service.ModelContextWindow(ids...)
 }
 
 func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
@@ -478,29 +530,39 @@ func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
 	items := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		items = append(items, map[string]any{
+		contextWindow := model.ContextWindow
+		item := map[string]any{
 			"id":                 model.ID,
 			"key":                model.ID,
 			"display_name":       model.Name,
 			"type":               "llm",
 			"publisher":          "lingma",
-			"max_context_length": 128000,
+			"max_context_length": modelMaximumContext(model),
+			"context_options":    model.ContextOptions,
+			"supports_text":      true,
+			"supports_vision":    model.SupportsVision,
+			"input_modalities":   modelInputModalities(model),
+			"capabilities":       map[string]bool{"vision": model.SupportsVision},
 			"loaded_instances": []map[string]any{
 				{
 					"id":    model.ID,
 					"model": model.ID,
 					"config": map[string]any{
-						"context_length": 128000,
+						"context_length": contextWindow,
 					},
 				},
 			},
-		})
+		}
+		if model.MaxInputTokens > 0 {
+			item["max_input_tokens"] = model.MaxInputTokens
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": items})
 }
@@ -517,25 +579,38 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
 	items := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		items = append(items, map[string]any{
-			"name":        model.ID,
-			"model":       model.ID,
-			"modified_at": time.Now().UTC().Format(time.RFC3339),
-			"size":        0,
-			"digest":      "",
+		capabilities := []string{"completion", "tools"}
+		if model.SupportsVision {
+			capabilities = append(capabilities, "vision")
+		}
+		item := map[string]any{
+			"name":             model.ID,
+			"model":            model.ID,
+			"modified_at":      time.Now().UTC().Format(time.RFC3339),
+			"size":             0,
+			"digest":           "",
+			"context_window":   model.ContextWindow,
+			"supports_text":    true,
+			"supports_vision":  model.SupportsVision,
+			"input_modalities": modelInputModalities(model),
+			"capabilities":     capabilities,
 			"details": map[string]any{
 				"family":             "lingma",
 				"families":           []string{"lingma"},
 				"parameter_size":     "",
 				"quantization_level": "",
 			},
-		})
+		}
+		if model.MaxInputTokens > 0 {
+			item["max_input_tokens"] = model.MaxInputTokens
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": items})
 }
@@ -554,11 +629,24 @@ func (s *Server) handleModelProps(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "kmodel"
 	}
+	contextWindow := modelContextWindow(model)
+	// Prefer the configured upstream limit; keep props available offline using
+	// the same compatibility hints as model discovery.
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if models, err := s.svc.ListModels(ctx); err == nil {
+		for _, candidate := range models {
+			if strings.EqualFold(model, candidate.ID) || strings.EqualFold(model, candidate.Name) || strings.EqualFold(model, candidate.InternalID) {
+				contextWindow = candidate.ContextWindow
+				break
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"model_alias":   model,
 		"chat_template": "{{ .Messages }}",
 		"default_generation_settings": map[string]any{
-			"n_ctx":       128000,
+			"n_ctx":       contextWindow,
 			"temperature": 0.7,
 			"top_p":       1,
 		},
@@ -649,7 +737,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, true)
 		return
 	}
 
@@ -720,7 +808,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
@@ -767,7 +855,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 	writeOpenAIResponse(w, result)
@@ -789,7 +877,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+			writeUpstreamAPIError(w, err, true)
 			return
 		}
 
@@ -906,7 +994,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, true)
 		return
 	}
 
@@ -1026,11 +1114,8 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 
 	if finalErr != nil {
 		_ = writeSSEEvent(w, flusher, "error", map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type":    "api_error",
-				"message": finalErr.Error(),
-			},
+			"type":  "error",
+			"error": upstreamAPIErrorPayload(finalErr),
 		})
 		return
 	}
@@ -1131,6 +1216,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
+			"input_tokens":  final.InputTokens,
 			"output_tokens": final.OutputTokens,
 		},
 	}); err != nil {
@@ -1248,7 +1334,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+			writeUpstreamAPIError(w, err, false)
 			return
 		}
 		streamingHeaders(w)
@@ -1286,14 +1372,18 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 			"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
 		})
+		if req.IncludeUsage {
+			writeOpenAIUsageChunk(w, flusher, chatID, created, model, result)
+		}
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
 
+	req.StreamNativeTools = true
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
@@ -1321,6 +1411,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	doneCh := done
 	var final *service.ChatResult
 	var finalErr error
+	streamedTools := false
 
 	for eventsCh != nil || doneCh != nil {
 		select {
@@ -1329,6 +1420,40 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
+				continue
+			}
+			if event.Type == service.StreamEventTool && event.ToolDelta != nil {
+				call := event.ToolDelta
+				function := map[string]any{}
+				if call.Name != "" {
+					function["name"] = call.Name
+				}
+				if call.ArgumentsFragment != "" {
+					function["arguments"] = call.ArgumentsFragment
+				}
+				tool := map[string]any{"index": call.Index, "function": function}
+				if call.ID != "" {
+					tool["id"] = call.ID
+				}
+				if call.Type != "" {
+					tool["type"] = call.Type
+				}
+				if err := writeOpenAIChunk(w, flusher, map[string]any{
+					"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": []any{tool}}, "finish_reason": nil}},
+				}); err != nil {
+					return
+				}
+				streamedTools = true
+				continue
+			}
+			if event.Type == service.StreamEventThinking {
+				if err := writeOpenAIChunk(w, flusher, map[string]any{
+					"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"reasoning_content": event.Delta}, "finish_reason": nil}},
+				}); err != nil {
+					return
+				}
 				continue
 			}
 			for _, delta := range filter.Push(event.Delta) {
@@ -1366,12 +1491,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 
 	if finalErr != nil {
 		_ = writeOpenAIChunk(w, flusher, map[string]any{
-			"error": map[string]any{
-				"message": finalErr.Error(),
-				"type":    "api_error",
-				"code":    nil,
-				"param":   nil,
-			},
+			"error": upstreamAPIErrorPayload(finalErr),
 		})
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
@@ -1415,6 +1535,9 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		}
 	}
 	for i, tc := range final.ToolCalls {
+		if streamedTools {
+			break
+		}
 		argsJSON, _ := json.Marshal(tc.Arguments)
 		_ = writeOpenAIChunk(w, flusher, map[string]any{
 			"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -1448,6 +1571,9 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		},
 	}); err != nil {
 		return
+	}
+	if req.IncludeUsage {
+		writeOpenAIUsageChunk(w, flusher, chatID, created, model, final)
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -1486,7 +1612,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			_ = emitter.Event("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+			_ = emitter.Event("error", map[string]any{"type": "error", "error": upstreamAPIErrorPayload(err)})
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			return
@@ -1497,7 +1623,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeUpstreamAPIError(w, err, false)
 		return
 	}
 
@@ -1545,7 +1671,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	}
 
 	if finalErr != nil {
-		_ = emitter.Event("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": finalErr.Error()}})
+		_ = emitter.Event("error", map[string]any{"type": "error", "error": upstreamAPIErrorPayload(finalErr)})
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
@@ -1595,8 +1721,19 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 }
 
 func shouldAggregateToolStream(req service.ChatRequest) bool {
+	if req.AggregateToolStream != nil {
+		return len(req.Tools) > 0 && *req.AggregateToolStream
+	}
 	return len(req.Tools) > 0 && truthyEnv("LINGMA_AGGREGATE_TOOL_STREAM")
 }
+
+// actionMarkerTailRunes is how many trailing runes stay buffered so an action
+// marker split across stream deltas is still detected before it reaches the
+// client. It only has to cover the longest marker (three backticks plus
+// "json action"), and a smaller tail means the first visible content chunk
+// reaches the client far sooner - which matters because clients time tokens per
+// second from that first chunk.
+const actionMarkerTailRunes = 16
 
 type toolStreamFilter struct {
 	enabled bool
@@ -1631,7 +1768,7 @@ func (f *toolStreamFilter) Push(delta string) []string {
 	if looksLikeActionPrefix(f.buffer) {
 		return nil
 	}
-	return f.flushSafeTail(96)
+	return f.flushSafeTail(actionMarkerTailRunes)
 }
 
 func (f *toolStreamFilter) Flush() []string {
@@ -1901,7 +2038,7 @@ func normalizeOpenAIRequest(req openAIChatRequest) (service.ChatRequest, error) 
 			}
 		case "tool":
 			output := strings.TrimSpace(extractText(message.Content))
-			if output == "" || message.ToolCallID == "" {
+			if message.ToolCallID == "" {
 				continue
 			}
 			messages = append(messages, service.ChatMessage{Role: "tool", Text: output, ToolCallID: message.ToolCallID})
@@ -1927,6 +2064,7 @@ func normalizeOpenAIRequest(req openAIChatRequest) (service.ChatRequest, error) 
 		User:              req.User,
 		ReasoningEffort:   req.ReasoningEffort,
 		ResponseFormat:    extractResponseFormat(req.ResponseFormat),
+		IncludeUsage:      req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}, nil
 }
 
@@ -2266,6 +2404,43 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+func upstreamAPIErrorPayload(err error) map[string]any {
+	payload := map[string]any{"type": "api_error", "message": err.Error(), "code": nil, "param": nil}
+	var upstream *remote.UpstreamError
+	if errors.As(err, &upstream) {
+		payload["status"] = upstream.StatusCode
+		payload["code"] = upstream.Code
+		if upstream.StatusCode == http.StatusTooManyRequests {
+			payload["type"] = "rate_limit_error"
+		}
+		if upstream.QuotaExhausted {
+			payload["code"] = "insufficient_quota"
+		}
+		if upstream.RetryAfter > 0 && !upstream.QuotaExhausted {
+			payload["retry_after_seconds"] = int64(math.Ceil(upstream.RetryAfter.Seconds()))
+		}
+	}
+	return payload
+}
+
+func writeUpstreamAPIError(w http.ResponseWriter, err error, anthropic bool) {
+	status := http.StatusInternalServerError
+	var upstream *remote.UpstreamError
+	if errors.As(err, &upstream) {
+		if upstream.StatusCode >= 400 && upstream.StatusCode <= 599 {
+			status = upstream.StatusCode
+		}
+		if upstream.RetryAfter > 0 && !upstream.QuotaExhausted {
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(upstream.RetryAfter.Seconds())), 10))
+		}
+	}
+	payload := map[string]any{"error": upstreamAPIErrorPayload(err)}
+	if anthropic {
+		payload["type"] = "error"
+	}
+	writeJSON(w, status, payload)
+}
+
 func writeAnthropicError(w http.ResponseWriter, status int, kind string, message string) {
 	writeJSON(w, status, map[string]any{
 		"type": "error",
@@ -2320,12 +2495,116 @@ func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult
 			"message":       message,
 			"finish_reason": finishReason,
 		}},
-		"usage": map[string]any{
-			"prompt_tokens":     result.InputTokens,
-			"completion_tokens": result.OutputTokens,
-			"total_tokens":      result.InputTokens + result.OutputTokens,
-		},
+		"usage": openAIUsagePayload(result),
 	})
+}
+
+// writeOpenAIUsageChunk emits the OpenAI-compatible trailing usage chunk
+// (`choices: []` + `usage`). Per the OpenAI streaming spec it is sent after the
+// finish chunk and before `data: [DONE]`; clients need it to display token
+// counts, token speed and context-window usage.
+func writeOpenAIUsageChunk(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model string, result *service.ChatResult) {
+	_ = writeOpenAIChunk(w, flusher, map[string]any{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{},
+		"usage":   openAIUsagePayload(result),
+	})
+}
+
+// openAIUsagePayload builds the OpenAI usage object shared by the streaming and
+// non-streaming chat completions endpoints. Session occupancy is separate from
+// per-request input/output counts. Cache-read and reasoning details are only advertised
+// when they are actually known, so clients never show a fabricated hit rate.
+func openAIUsagePayload(result *service.ChatResult) map[string]any {
+	promptTokens := 0
+	completionTokens := 0
+	cachedTokens := 0
+	reasoningTokens := 0
+	outputSpeed := 0.0
+	if result != nil {
+		promptTokens = result.InputTokens
+		completionTokens = result.OutputTokens
+		cachedTokens = result.CachedTokens
+		reasoningTokens = result.ReasoningTokens
+		started := result.FirstTokenTime
+		if started.IsZero() {
+			started = result.StartTime
+		}
+		if result.StreamedTokenEvents > 1 && !started.IsZero() && result.EndTime.After(started) && result.OutputTokens > 0 {
+			outputSpeed = float64(result.OutputTokens) / result.EndTime.Sub(started).Seconds()
+		}
+
+	}
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	cachedTokens = min(promptTokens, max(0, cachedTokens))
+	reasoningTokens = min(completionTokens, max(0, reasoningTokens))
+	usage := map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+	}
+	// Speed requires measured upstream timing, never SSE replay timing.
+	if outputSpeed > 0 {
+		usage["output_speed_tokens_per_second"] = outputSpeed
+	}
+	if cachedTokens > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cachedTokens}
+	}
+	if reasoningTokens > 0 {
+		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoningTokens}
+	}
+	if result != nil && (result.UsedTokens > 0 || result.LimitTokens > 0) {
+		contextUsage := map[string]any{"used_tokens": max(0, result.UsedTokens)}
+		if result.LimitTokens > 0 {
+			contextUsage["limit_tokens"] = result.LimitTokens
+		}
+		if result.ContextUsageEstimated {
+			contextUsage["source"] = "estimated"
+		} else {
+			contextUsage["source"] = "upstream"
+		}
+		usage["context_window"] = contextUsage
+	}
+	if result != nil && (result.InputTokensEstimated || result.OutputTokensEstimated) {
+		inputSource, outputSource := "upstream", "upstream"
+		if result.InputTokensEstimated {
+			inputSource = "estimated"
+		}
+		if result.OutputTokensEstimated {
+			outputSource = "estimated"
+		}
+		usage["token_count_source"] = map[string]any{"input_tokens": inputSource, "output_tokens": outputSource}
+	}
+	return usage
+}
+
+func openAIResponsesUsagePayload(result *service.ChatResult) map[string]any {
+	chat := openAIUsagePayload(result)
+	usage := map[string]any{
+		"input_tokens":  chat["prompt_tokens"],
+		"output_tokens": chat["completion_tokens"],
+		"total_tokens":  chat["total_tokens"],
+	}
+	for source, target := range map[string]string{
+		"prompt_tokens_details":          "input_tokens_details",
+		"completion_tokens_details":      "output_tokens_details",
+		"context_window":                 "context_window",
+		"token_count_source":             "token_count_source",
+		"output_speed_tokens_per_second": "output_speed_tokens_per_second",
+	} {
+		if value, ok := chat[source]; ok {
+			usage[target] = value
+		}
+	}
+	return usage
 }
 
 func writeOpenAIResponse(w http.ResponseWriter, result *service.ChatResult) {
@@ -2395,11 +2674,7 @@ func buildOpenAIResponseBody(responseID string, created int64, model string, res
 		"model":       model,
 		"output":      output,
 		"output_text": text,
-		"usage": map[string]any{
-			"input_tokens":  result.InputTokens,
-			"output_tokens": result.OutputTokens,
-			"total_tokens":  result.InputTokens + result.OutputTokens,
-		},
+		"usage":       openAIResponsesUsagePayload(result),
 	}
 }
 
@@ -2871,21 +3146,6 @@ func withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func maxConcurrentRequests() int {
-	raw := strings.TrimSpace(os.Getenv("LINGMA_PROXY_MAX_CONCURRENT"))
-	if raw == "" {
-		return 4
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 {
-		return 4
-	}
-	if n > 16 {
-		return 16
-	}
-	return n
 }
 
 func (s *Server) acquire(ctx context.Context) bool {

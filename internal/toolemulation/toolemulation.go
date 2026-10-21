@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -279,7 +282,15 @@ func InjectTooling(system string, tools []ToolDef, choice ToolChoice, parallel *
 
 func AssistantToolCallsToText(content string, calls []ToolCall) string {
 	content = strings.TrimSpace(content)
-	return content
+	parts := []string{}
+	if content != "" {
+		parts = append(parts, content)
+	}
+	for _, call := range calls {
+		args, _ := json.Marshal(call.Arguments)
+		parts = append(parts, fmt.Sprintf("[tool call id=%s name=%s arguments=%s]", call.ID, call.Name, args))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func ActionOutputPrompt(toolCallID string, output string) string {
@@ -547,6 +558,9 @@ func LooksLikeMissedToolUse(text string) bool {
 		"需要使用",
 		"我需要使用",
 		"让我使用",
+		"让我先搜索", "让我搜索", "我将搜索", "我来搜索",
+		"让我调研", "我将调研", "我将为您调研", "让我为您搜索",
+		"让我先查看", "我先查看", "让我先读取", "我需要先查询",
 		"让我尝试",
 		"执行命令",
 		"编辑文件",
@@ -630,6 +644,10 @@ func inferLocalCommand(text string) string {
 }
 
 func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, string, error) {
+	return ParseActionBlocksWithContext(text, tools, ToolChoice{}, "", cfg)
+}
+
+func ParseActionBlocksWithContext(text string, tools []ToolDef, choice ToolChoice, context string, cfg Config) ([]ToolCall, string, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, "", nil
 	}
@@ -639,18 +657,14 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 
 	openings := findActionOpenings(text)
 	if len(openings) == 0 {
-		return nil, strings.TrimSpace(text), nil
-	}
-
-	// Build lookup maps for tool alias normalization and schema filtering.
-	toolNameMap := make(map[string]string, len(tools))
-	toolSchemaMap := make(map[string]map[string]any, len(tools))
-	for _, t := range tools {
-		name := strings.TrimSpace(t.Name)
-		if name != "" {
-			toolNameMap[strings.ToLower(name)] = name
-			toolSchemaMap[name] = t.InputSchema
+		// Only accept a bare object when the entire response is a tool call.
+		if call, ok := parseToolCallJSON(strings.TrimSpace(text)); ok {
+			calls, err := NormalizeToolCalls([]ToolCall{call}, tools, choice, context)
+			if err == nil && len(calls) > 0 {
+				return calls, "", nil
+			}
 		}
+		return nil, strings.TrimSpace(text), nil
 	}
 
 	type span struct{ start, end int }
@@ -680,19 +694,11 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 		if !ok {
 			continue
 		}
-		if normalized := normalizeToolName(call.Name, toolNameMap); normalized != "" {
-			call.Name = normalized
-		}
-		if _, ok := toolNameMap[strings.ToLower(strings.TrimSpace(call.Name))]; !ok {
+		normalized, err := NormalizeToolCalls([]ToolCall{call}, tools, choice, context)
+		if err != nil || len(normalized) == 0 {
 			continue
 		}
-		// Filter arguments against the tool's input schema to strip unknown params
-		if schema, ok := toolSchemaMap[call.Name]; ok && len(schema) > 0 {
-			call.Arguments = filterArgsBySchema(call.Arguments, schema)
-			if !hasRequiredArgs(call.Arguments, schema) {
-				continue
-			}
-		}
+		call = normalized[0]
 		spans = append(spans, span{start: start, end: end + 3})
 		key := toolCallKey(call)
 		if seen[key] {
@@ -793,7 +799,7 @@ func containsString(values []string, value string) bool {
 
 func findActionOpenings(text string) []int {
 	out := make([]int, 0)
-	searches := []string{"```json action", "```json\n", "```json\r\n"}
+	searches := []string{"```json action", "```action", "``` action", "```json\n", "```json\r\n"}
 	for idx := 0; idx < len(text); {
 		foundAt := -1
 		foundLen := 0
@@ -848,11 +854,14 @@ func findClosingFence(text string, from int) int {
 }
 
 func parseToolCallJSON(raw string) (ToolCall, bool) {
-	raw = normalizeJSON(raw)
-
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return ToolCall{}, false
+		if err := json.Unmarshal([]byte(normalizeJSON(raw)), &obj); err != nil {
+			return ToolCall{}, false
+		}
+	}
+	if fn, ok := obj["function"].(map[string]any); ok {
+		obj = fn
 	}
 
 	name := strings.TrimSpace(stringFromAny(obj["tool"]))
@@ -871,8 +880,13 @@ func parseToolCallJSON(raw string) (ToolCall, bool) {
 		args, _ = obj["input"].(map[string]any)
 	}
 	if args == nil {
-		if s := strings.TrimSpace(stringFromAny(obj["parameters"])); s != "" {
-			_ = json.Unmarshal([]byte(s), &args)
+		for _, key := range []string{"parameters", "arguments", "input"} {
+			if s, ok := obj[key].(string); ok {
+				if json.Unmarshal([]byte(s), &args) != nil || args == nil {
+					return ToolCall{}, false
+				}
+				break
+			}
 		}
 	}
 	if args == nil {
@@ -899,15 +913,161 @@ func parseToolCallJSON(raw string) (ToolCall, bool) {
 
 func normalizeJSON(text string) string {
 	text = strings.TrimSpace(text)
-	replacer := strings.NewReplacer(
-		"\u201c", "\"", "\u201d", "\"",
-		"“", "\"", "”", "\"",
-		",\n}", "\n}",
-		",\n]", "\n]",
-		", }", " }",
-		", ]", " ]",
-	)
-	return replacer.Replace(text)
+	var b strings.Builder
+	inString, escaped, smart := false, false, false
+	for i := 0; i < len(text); {
+		if !inString && (strings.HasPrefix(text[i:], "“") || strings.HasPrefix(text[i:], "”")) {
+			b.WriteByte('"')
+			inString, smart = true, true
+			i += len("“")
+			continue
+		}
+		if inString && smart && !escaped && strings.HasPrefix(text[i:], "”") {
+			b.WriteByte('"')
+			inString, smart = false, false
+			i += len("”")
+			continue
+		}
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' && !smart {
+				inString = false
+			}
+		} else if ch == '"' {
+			inString = true
+		} else if ch == ',' {
+			tail := strings.TrimLeft(text[i+1:], " \t\r\n")
+			if strings.HasPrefix(tail, "}") || strings.HasPrefix(tail, "]") {
+				i++
+				continue
+			}
+		}
+		b.WriteByte(ch)
+		i++
+	}
+	return b.String()
+}
+
+// NormalizeToolCalls applies the same contract to native and emulated calls.
+// PTC forwarding is limited to functions explicitly declared as tools.NAME.
+func NormalizeToolCalls(calls []ToolCall, tools []ToolDef, choice ToolChoice, context string) ([]ToolCall, error) {
+	available := availableToolNames(tools)
+	for _, tool := range tools {
+		context += "\n" + tool.Description
+	}
+	var out []ToolCall
+	seen := map[string]bool{}
+	for _, call := range calls {
+		if choice.Mode == "none" {
+			return nil, fmt.Errorf("tool_choice=none forbids tool calls")
+		}
+		if raw, ok := call.Arguments["raw_arguments"].(string); ok {
+			parsed, valid := parseToolCallJSON(`{"tool":` + strconv.Quote(call.Name) + `,"parameters":` + normalizeJSON(raw) + `}`)
+			if !valid {
+				return nil, fmt.Errorf("invalid JSON arguments for %s", call.Name)
+			}
+			call.Arguments = parsed.Arguments
+		}
+		name := normalizeToolName(call.Name, available)
+		if _, ok := available[strings.ToLower(name)]; !ok {
+			inner := strings.TrimPrefix(strings.TrimSpace(call.Name), "tools.")
+			declared := regexp.MustCompile(`\btools\.([A-Za-z_$][A-Za-z0-9_$]*)\b`).FindAllStringSubmatch(context, -1)
+			allowed := false
+			for _, match := range declared {
+				allowed = allowed || match[1] == inner
+			}
+			if len(tools) != 1 || !strings.EqualFold(tools[0].Name, "run_code") || !allowed {
+				return nil, fmt.Errorf("unknown tool %q; use an advertised tool", call.Name)
+			}
+			args, _ := json.Marshal(call.Arguments)
+			call.Name = tools[0].Name
+			call.Arguments = map[string]any{"code": "const result = await tools[" + strconv.Quote(inner) + "](" + string(args) + "); console.log(JSON.stringify(result));"}
+		} else {
+			call.Name = name
+		}
+		if choice.Mode == "tool" && !strings.EqualFold(call.Name, choice.Name) {
+			return nil, fmt.Errorf("tool_choice requires %s", choice.Name)
+		}
+		for _, tool := range tools {
+			if call.Name == tool.Name {
+				call.Arguments = filterArgsBySchema(call.Arguments, tool.InputSchema)
+				if err := validateValue(call.Arguments, tool.InputSchema); err != nil {
+					return nil, fmt.Errorf("invalid arguments for %s: %w", call.Name, err)
+				}
+			}
+		}
+		key := toolCallKey(call)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if call.ID == "" {
+			call.ID = newCallID()
+		}
+		out = append(out, call)
+	}
+	return out, nil
+}
+
+func validateValue(value any, schema map[string]any) error {
+	if len(schema) == 0 {
+		return nil
+	}
+	valid := true
+	switch schema["type"] {
+	case "string":
+		_, valid = value.(string)
+	case "number", "integer":
+		n, ok := value.(float64)
+		if i, isInt := value.(int); isInt {
+			n, ok = float64(i), true
+		}
+		valid = ok && (schema["type"] != "integer" || n == math.Trunc(n))
+	case "boolean":
+		_, valid = value.(bool)
+	case "array":
+		items, ok := value.([]any)
+		valid = ok
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for _, item := range items {
+				if err := validateValue(item, itemSchema); err != nil {
+					return err
+				}
+			}
+		}
+	case "object":
+		_, valid = value.(map[string]any)
+	}
+	if !valid {
+		return fmt.Errorf("expected %v", schema["type"])
+	}
+	if args, ok := value.(map[string]any); ok {
+		if !hasRequiredArgs(args, schema) {
+			return fmt.Errorf("missing required argument")
+		}
+		props, _ := schema["properties"].(map[string]any)
+		for key, value := range args {
+			prop, _ := props[key].(map[string]any)
+			if err := validateValue(value, prop); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	if enum, ok := schema["enum"].([]any); ok {
+		encoded, _ := json.Marshal(value)
+		for _, candidate := range enum {
+			other, _ := json.Marshal(candidate)
+			if string(encoded) == string(other) {
+				return nil
+			}
+		}
+		return fmt.Errorf("value is outside enum")
+	}
+	return nil
 }
 
 func compactSchema(schema map[string]any) string {

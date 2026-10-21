@@ -3,6 +3,7 @@ package remote
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -25,7 +26,7 @@ func TestSaveCredentialFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat credentials file: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0600 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0600 {
 		t.Fatalf("credentials file mode = %o, want 0600", got)
 	}
 

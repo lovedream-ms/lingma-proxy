@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,8 +19,13 @@ import (
 	"strings"
 	"time"
 
+	"lingma-ipc-proxy/internal/modelmeta"
 	"lingma-ipc-proxy/internal/toolemulation"
+	"lingma-ipc-proxy/internal/utils"
 )
+
+func modelContextWindow(ids ...string) int   { return modelmeta.ContextWindow(ids...) }
+func modelSupportsVision(ids ...string) bool { return modelmeta.Vision(ids...) }
 
 const (
 	DefaultBaseURL = "https://lingma.alibabacloud.com"
@@ -30,18 +36,49 @@ const (
 
 var remoteBaseURLPattern = regexp.MustCompile(`https?://[^\s"'<>),\]}]+`)
 
+func (c *Client) validateURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %w", err)
+	}
+	if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Hostname() == "" {
+		return fmt.Errorf("invalid remote HTTP(S) URL: %q", rawURL)
+	}
+	// The base URL is an explicit local setting, including custom/test upstreams.
+	return nil
+}
+
+// sanitizeHeaders preserves protocol authentication while stripping CR/LF values.
+func sanitizeHeaders(headers map[string]string) map[string]string {
+	safeHeaders := make(map[string]string, len(headers))
+	for k, v := range headers {
+		safeHeaders[k] = sanitizeHeaderValue(v)
+	}
+	return safeHeaders
+}
+func sanitizeHeaderValue(value string) string {
+	// Remove control characters and newlines that could be used for header injection
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, "\n", "")
+	value = strings.TrimSpace(value)
+	return value
+}
+
 type Config struct {
-	BaseURL     string
-	AuthFile    string
-	ProxyURL    string
-	CosyVersion string
-	Timeout     time.Duration
+	MaxRetries     int
+	RetryBaseDelay time.Duration
+	BaseURL        string
+	AuthFile       string
+	ProxyURL       string
+	CosyVersion    string
+	Timeout        time.Duration
 }
 
 type Client struct {
 	cfg         Config
 	client      *http.Client
 	autoBaseURL bool
+	autoVersion bool
 }
 
 type BaseURLHint struct {
@@ -55,13 +92,21 @@ type baseURLCacheFile struct {
 }
 
 type Model struct {
-	Key         string `json:"key"`
-	DisplayName string `json:"display_name"`
-	Model       string `json:"model"`
-	Enable      bool   `json:"enable"`
+	MaxContextLength    int    `json:"max_context_length,omitempty"`
+	ContextOptions      []int  `json:"context_options,omitempty"`
+	MaxInputTokens      int    `json:"max_input_tokens,omitempty"`
+	Key                 string `json:"key"`
+	DisplayName         string `json:"display_name"`
+	Model               string `json:"model"`
+	Enable              bool   `json:"enable"`
+	ContextWindow       int    `json:"context_window,omitempty"`
+	SupportsVision      bool   `json:"supports_vision,omitempty"`
+	SupportsVisionKnown bool   `json:"-"`
 }
 
 type ChatRequest struct {
+	OnReasoning     func(string)
+	OnToolDelta     func(ToolCallFragment)
 	Model           string
 	Prompt          string
 	Messages        []Message
@@ -89,12 +134,17 @@ type Message struct {
 }
 
 type ChatResult struct {
-	Text          string
-	InputTokens   int
-	OutputTokens  int
-	RequestID     string
-	CredentialSrc string
-	ToolCalls     []toolemulation.ToolCall
+	Text                  string
+	ThoughtText           string
+	InputTokens           int
+	OutputTokens          int
+	InputTokensEstimated  bool
+	OutputTokensEstimated bool
+	CachedTokens          int
+	ReasoningTokens       int
+	RequestID             string
+	CredentialSrc         string
+	ToolCalls             []toolemulation.ToolCall
 }
 
 type StreamEvent struct {
@@ -102,6 +152,7 @@ type StreamEvent struct {
 }
 
 func New(cfg Config) *Client {
+	autoVersion := strings.TrimSpace(cfg.CosyVersion) == ""
 	autoBaseURL := strings.TrimSpace(cfg.BaseURL) == "" && strings.TrimSpace(os.Getenv("LINGMA_REMOTE_BASE_URL")) == ""
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = ResolveBaseURL("")
@@ -110,11 +161,27 @@ func New(cfg Config) *Client {
 		cfg.CosyVersion = "2.11.2"
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	client := &http.Client{Timeout: cfg.Timeout}
-	if transport, err := transportForProxy(cfg.ProxyURL); err == nil && transport != nil {
-		client.Transport = transport
+
+	// Create HTTP client with connection pooling and timeout handling
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   false,
 	}
-	return &Client{cfg: cfg, client: client, autoBaseURL: autoBaseURL}
+
+	// Apply proxy if configured
+	if proxyTransport, err := transportForProxy(cfg.ProxyURL); err == nil && proxyTransport != nil {
+		transport = proxyTransport
+	}
+
+	client := &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+	}
+
+	return &Client{cfg: cfg, client: client, autoBaseURL: autoBaseURL, autoVersion: autoVersion}
 }
 
 func ValidateProxyURL(value string) error {
@@ -260,11 +327,12 @@ func (c *Client) Warmup(ctx context.Context) error {
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
-	models, err := c.listModels(ctx)
-	if err == nil && c.autoBaseURL {
-		cacheSuccessfulBaseURL(c.cfg.BaseURL)
+	cred, err := LoadCredential(c.cfg.AuthFile)
+	if err != nil {
+		return nil, err
 	}
-	if err == nil || !c.autoBaseURL || ctx.Err() != nil {
+	models, err := c.listModelsWithCredential(ctx, cred)
+	if err == nil || !c.autoBaseURL || ctx.Err() != nil || cred.Desktop != nil {
 		return models, err
 	}
 	return c.listModelsWithAutoBaseURLFallback(ctx, err)
@@ -275,11 +343,36 @@ func (c *Client) listModels(ctx context.Context) ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.listModelsWithCredential(ctx, cred)
+}
+
+func (c *Client) credentialBaseURL(cred Credential) string {
+	if c.autoBaseURL && cred.Desktop != nil && cred.Desktop.BaseURL != "" {
+		return strings.TrimRight(cred.Desktop.BaseURL, "/")
+	}
+	return c.cfg.BaseURL
+}
+
+func (c *Client) credentialVersion(cred Credential) string {
+	if c.autoVersion && cred.Desktop != nil && cred.Desktop.Version != "" {
+		return cred.Desktop.Version
+	}
+	return c.cfg.CosyVersion
+}
+
+func (c *Client) listModelsWithCredential(ctx context.Context, cred Credential) ([]Model, error) {
+	baseURL := c.credentialBaseURL(cred)
+
+	// Validate the base URL to prevent SSRF
+	if err := c.validateURL(baseURL); err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+
 	headers, err := c.headers(cred, modelListPath, "")
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+modelListPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+modelListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -288,21 +381,25 @@ func (c *Client) listModels(ctx context.Context) ([]Model, error) {
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch models: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
 		return nil, c.modelListStatusError(resp.StatusCode, string(body))
 	}
-	var payload struct {
-		Chat   []Model `json:"chat"`
-		Inline []Model `json:"inline"`
+	parsed, err := modelmeta.ParseJSON(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse model list response: %w", err)
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
+	models := make([]Model, 0, len(parsed))
+	for _, m := range parsed {
+		models = append(models, Model{Key: m.ID, DisplayName: m.Name, Enable: true, ContextWindow: m.ContextWindow, MaxContextLength: m.MaxContextLength, ContextOptions: m.ContextOptions, MaxInputTokens: m.MaxInputTokens, SupportsVision: m.SupportsVision, SupportsVisionKnown: m.SupportsVisionKnown})
 	}
-	return append(payload.Chat, payload.Inline...), nil
+	if c.autoBaseURL {
+		cacheSuccessfulBaseURL(baseURL)
+	}
+	return models, nil
 }
 
 func (c *Client) listModelsWithAutoBaseURLFallback(ctx context.Context, firstErr error) ([]Model, error) {
@@ -343,13 +440,20 @@ func (c *Client) modelListStatusError(statusCode int, body string) error {
 	return fmt.Errorf("%s", message)
 }
 
-func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(string)) (*ChatResult, error) {
+func (c *Client) chatAttempt(ctx context.Context, request ChatRequest, onDelta func(string)) (*ChatResult, error) {
 	cred, err := LoadCredential(c.cfg.AuthFile)
 	if err != nil {
 		return nil, err
 	}
+	baseURL := c.credentialBaseURL(cred)
+	if c.autoBaseURL && cred.Desktop != nil && cred.Desktop.InferenceURL != "" {
+		baseURL = cred.Desktop.InferenceURL
+	}
+	if err := c.validateURL(baseURL); err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
 	requestID := newHexID()
-	body, err := c.buildBody(requestID, request)
+	body, err := c.buildBody(requestID, request, c.credentialVersion(cred))
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +461,7 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+chatPath+chatQuery, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+chatPath+chatQuery, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -370,17 +474,33 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("remote chat status %d: %s", resp.StatusCode, truncate(string(respBody), 1000))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
+		return nil, newUpstreamError(resp.StatusCode, string(respBody), resp.Header)
 	}
 	var builder strings.Builder
+	var reasoningBuilder strings.Builder
+	var lastUsage *remoteUsage
 	toolCallBuffer := newRemoteToolCallBuffer()
 	if err := scanSSE(resp.Body, func(event sseEvent) error {
 		if event.Done {
 			return nil
 		}
+		if event.Usage != nil {
+			lastUsage = mergeRemoteUsage(lastUsage, event.Usage)
+		}
 		if len(event.ToolCalls) > 0 {
 			toolCallBuffer.Add(event.ToolCalls)
+			if request.OnToolDelta != nil {
+				for _, call := range event.ToolCalls {
+					request.OnToolDelta(call)
+				}
+			}
+		}
+		if event.Reasoning != "" {
+			reasoningBuilder.WriteString(event.Reasoning)
+			if request.OnReasoning != nil {
+				request.OnReasoning(event.Reasoning)
+			}
 		}
 		if event.Content == "" {
 			return nil
@@ -391,20 +511,83 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 		}
 		return nil
 	}); err != nil {
+		var upstream *UpstreamError
+		if errors.As(err, &upstream) {
+			if delay := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); delay > upstream.RetryAfter {
+				upstream.RetryAfter = delay
+			}
+		}
 		return nil, err
 	}
-	text := builder.String()
-	return &ChatResult{
-		Text:          text,
-		InputTokens:   estimateTokens(request.Prompt),
-		OutputTokens:  estimateTokens(text),
-		RequestID:     requestID,
-		CredentialSrc: cred.Source,
-		ToolCalls:     toolCallBuffer.Calls(),
-	}, nil
+	return buildChatResult(request, builder.String(), reasoningBuilder.String(), lastUsage, requestID, cred.Source, toolCallBuffer.Calls()), nil
 }
 
-func (c *Client) buildBody(requestID string, request ChatRequest) (string, error) {
+// buildChatResult prefers token counts reported by the upstream and falls back
+// to local estimates when the upstream streams no usage at all.
+func buildChatResult(
+	request ChatRequest,
+	text string,
+	reasoning string,
+	usage *remoteUsage,
+	requestID string,
+	credentialSource string,
+	toolCalls []toolemulation.ToolCall,
+) *ChatResult {
+	estimator := &utils.TokenEstimator{}
+	result := &ChatResult{
+		Text:                  text,
+		ThoughtText:           reasoning,
+		InputTokensEstimated:  true,
+		OutputTokensEstimated: true,
+		RequestID:             requestID,
+		CredentialSrc:         credentialSource,
+		ToolCalls:             toolCalls,
+	}
+	if usage != nil && (usage.promptPresent || usage.PromptTokens > 0) && usage.PromptTokens >= 0 {
+		result.InputTokens = usage.PromptTokens
+		result.InputTokensEstimated = false
+	} else {
+		prompt := request.Prompt
+		if len(request.Tools) > 0 {
+			tools, _ := json.Marshal(projectTools(request.Tools))
+			prompt += string(tools)
+		}
+		result.InputTokens = estimator.EstimateTokensOrZero(prompt)
+	}
+	if usage != nil && (usage.completionPresent || usage.CompletionTokens > 0) && usage.CompletionTokens >= 0 {
+		result.OutputTokens = usage.CompletionTokens
+		result.OutputTokensEstimated = false
+	} else {
+		output := text + reasoning
+		if len(toolCalls) > 0 {
+			calls, _ := json.Marshal(toolCalls)
+			output += string(calls)
+		}
+		result.OutputTokens = estimator.EstimateTokensOrZero(output)
+	}
+	result.CachedTokens = min(result.InputTokens, max(0, usage.cacheReadTokens()))
+	if usage != nil && usage.CompletionTokensDetails != nil {
+		result.ReasoningTokens = usage.reasoningTokens()
+	} else {
+		result.ReasoningTokens = estimator.EstimateTokensOrZero(reasoning)
+	}
+	result.ReasoningTokens = min(result.OutputTokens, max(0, result.ReasoningTokens))
+	return result
+}
+
+// estimateTokensOrZero estimates tokens but reports empty text as zero.
+func estimateTokensOrZero(text string) int {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+	return estimateTokens(text)
+}
+
+func (c *Client) buildBody(requestID string, request ChatRequest, versions ...string) (string, error) {
+	version := c.cfg.CosyVersion
+	if len(versions) > 0 {
+		version = versions[0]
+	}
 	temperature := 0.1
 	if request.Temperature != nil {
 		temperature = *request.Temperature
@@ -446,7 +629,7 @@ func (c *Client) buildBody(requestID string, request ChatRequest) (string, error
 		"messages": projectMessages(request),
 		"business": map[string]any{
 			"product":  "jb_plugin",
-			"version":  c.cfg.CosyVersion,
+			"version":  version,
 			"type":     "memory",
 			"id":       newUUID(),
 			"begin_at": time.Now().UnixMilli(),
@@ -654,9 +837,14 @@ func (c *Client) headers(cred Credential, path string, body string) (map[string]
 		return nil, err
 	}
 	date := strconv.FormatInt(time.Now().Unix(), 10)
+	version := c.credentialVersion(cred)
+	ideVersion := ""
+	if cred.Desktop != nil {
+		ideVersion = version
+	}
 	authPayload := map[string]string{
-		"cosyVersion": c.cfg.CosyVersion,
-		"ideVersion":  "",
+		"cosyVersion": version,
+		"ideVersion":  ideVersion,
 		"info":        cred.EncryptUserInfo,
 		"requestId":   newUUID(),
 		"version":     "v1",
@@ -674,7 +862,7 @@ func (c *Client) headers(cred Credential, path string, body string) (map[string]
 		normalizePath(path),
 	}, "\n")
 	signature := md5.Sum([]byte(preimage))
-	return map[string]string{
+	headers := map[string]string{
 		"Authorization":     fmt.Sprintf("Bearer COSY.%s.%x", payloadBase64, signature),
 		"Content-Type":      "application/json",
 		"Appcode":           "cosy",
@@ -687,12 +875,26 @@ func (c *Client) headers(cred Credential, path string, body string) (map[string]
 		"Cosy-Machineos":    MachineOSHeader(),
 		"Cosy-Machinetoken": "",
 		"Cosy-Machinetype":  "",
-		"Cosy-Version":      c.cfg.CosyVersion,
+		"Cosy-Version":      version,
 		"Login-Version":     "v2",
 		"User-Agent":        "lingma-proxy/remote",
 		"Accept":            "text/event-stream",
 		"Cache-Control":     "no-cache",
-	}, nil
+	}
+	if desktop := cred.Desktop; desktop != nil {
+		headers["Cosy-Machinetoken"] = desktop.MachineToken
+		headers["Cosy-Machinetype"] = desktop.MachineType
+		headers["Cosy-Machinecode"] = desktop.MachineCode
+		if desktop.MachineOS != "" {
+			headers["Cosy-Machineos"] = desktop.MachineOS
+		}
+		headers["Cosy-Clienttype"] = "0"
+		headers["Cosy-Organization-Id"] = desktop.OrganizationID
+		headers["Cosy-Data-Policy"] = desktop.DataPolicy
+	}
+
+	// Sanitize headers to prevent injection attacks
+	return sanitizeHeaders(headers), nil
 }
 
 func normalizePath(path string) string {
@@ -700,26 +902,162 @@ func normalizePath(path string) string {
 }
 
 type outerSSE struct {
-	Body       string `json:"body"`
-	StatusCode int    `json:"statusCodeValue"`
+	Headers    json.RawMessage `json:"headers"`
+	Body       string          `json:"body"`
+	StatusCode int             `json:"statusCodeValue"`
 }
 
 type innerSSE struct {
+	Error   json.RawMessage `json:"error"`
 	Choices []struct {
 		Delta struct {
-			Content   string                `json:"content"`
-			ToolCalls []remoteToolCallDelta `json:"tool_calls"`
+			Content          string                `json:"content"`
+			ReasoningContent string                `json:"reasoning_content"`
+			ToolCalls        []remoteToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
+		Usage *remoteUsage `json:"usage"`
 	} `json:"choices"`
+	Usage *remoteUsage `json:"usage"`
+}
+
+// remoteUsage mirrors the OpenAI usage object. Upstreams differ in where they
+// hang cached and reasoning counts, so every documented spelling is decoded.
+type remoteUsage struct {
+	promptPresent       bool
+	completionPresent   bool
+	cachedPresent       bool
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	CachedTokens        int `json:"cached_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+// UnmarshalJSON keeps explicit zero counts and accepts Responses-style aliases.
+func (u *remoteUsage) UnmarshalJSON(data []byte) error {
+	type wireUsage remoteUsage
+	var decoded wireUsage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*u = remoteUsage(decoded)
+	read := func(primary, alias string, dst *int) (bool, error) {
+		for _, key := range []string{primary, alias} {
+			if raw, ok := fields[key]; ok && string(raw) != "null" {
+				if err := json.Unmarshal(raw, dst); err != nil {
+					return false, err
+				}
+				return *dst >= 0, nil
+			}
+		}
+		return false, nil
+	}
+	var err error
+	if u.promptPresent, err = read("prompt_tokens", "input_tokens", &u.PromptTokens); err != nil {
+		return err
+	}
+	if u.completionPresent, err = read("completion_tokens", "output_tokens", &u.CompletionTokens); err != nil {
+		return err
+	}
+	if raw, ok := fields["cached_tokens"]; ok && string(raw) != "null" {
+		u.cachedPresent = u.CachedTokens >= 0
+	}
+	if u.PromptTokensDetails == nil {
+		if raw, ok := fields["input_tokens_details"]; ok {
+			if err := json.Unmarshal(raw, &u.PromptTokensDetails); err != nil {
+				return err
+			}
+		}
+	}
+	if u.CompletionTokensDetails == nil {
+		if raw, ok := fields["output_tokens_details"]; ok {
+			if err := json.Unmarshal(raw, &u.CompletionTokensDetails); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Usage frames contain cumulative snapshots, not per-chunk increments. Preserve
+// fields omitted by a later partial frame without adding repeated totals.
+func mergeRemoteUsage(previous, next *remoteUsage) *remoteUsage {
+	if next == nil {
+		return previous
+	}
+	if previous == nil {
+		return next
+	}
+	merged := *previous
+	if next.promptPresent || next.PromptTokens > 0 {
+		merged.PromptTokens, merged.promptPresent = next.PromptTokens, true
+	}
+	if next.completionPresent || next.CompletionTokens > 0 {
+		merged.CompletionTokens, merged.completionPresent = next.CompletionTokens, true
+	}
+	if next.TotalTokens > 0 {
+		merged.TotalTokens = next.TotalTokens
+	}
+	if next.PromptTokensDetails != nil {
+		merged.PromptTokensDetails = next.PromptTokensDetails
+	}
+	if next.CompletionTokensDetails != nil {
+		merged.CompletionTokensDetails = next.CompletionTokensDetails
+	}
+	if next.cachedPresent || next.CachedTokens > 0 {
+		merged.CachedTokens = next.CachedTokens
+		merged.cachedPresent = true
+		if next.PromptTokensDetails == nil {
+			merged.PromptTokensDetails = nil
+		}
+	}
+	return &merged
+}
+
+// cacheReadTokens returns the reported prompt-cache hit tokens, preferring the
+// nested prompt_tokens_details spelling (Kimi also documents a top-level one).
+func (u *remoteUsage) cacheReadTokens() int {
+	if u == nil {
+		return 0
+	}
+	if u.PromptTokensDetails != nil {
+		return max(0, u.PromptTokensDetails.CachedTokens)
+	}
+	if u.CachedTokens > 0 {
+		return u.CachedTokens
+	}
+	return 0
+}
+
+// reasoningTokens returns the reasoning tokens the upstream reports separately
+// from the visible completion tokens.
+func (u *remoteUsage) reasoningTokens() int {
+	if u == nil || u.CompletionTokensDetails == nil {
+		return 0
+	}
+	return u.CompletionTokensDetails.ReasoningTokens
 }
 
 type sseEvent struct {
 	Content   string
+	Reasoning string
 	ToolCalls []remoteToolCallFragment
+	Usage     *remoteUsage
 	Done      bool
 }
 
-type remoteToolCallFragment struct {
+type remoteToolCallFragment = ToolCallFragment
+
+type ToolCallFragment struct {
 	Index             int
 	ID                string
 	Type              string
@@ -740,6 +1078,7 @@ type remoteToolCallDelta struct {
 func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
@@ -751,16 +1090,25 @@ func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 		}
 		event, ok, err := parseSSEPayload(payload)
 		if err != nil {
-			return err
+			var upstream *UpstreamError
+			if errors.As(err, &upstream) {
+				return upstream
+			}
+			return fmt.Errorf("failed to parse SSE event: %w", err)
 		}
 		if !ok {
 			continue
 		}
 		if err := onEvent(event); err != nil {
-			return err
+			return fmt.Errorf("failed to process SSE event: %w", err)
 		}
 	}
-	return scanner.Err()
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scanner error during SSE processing: %w", err)
+	}
+
+	return nil
 }
 
 func parseSSEPayload(payload string) (sseEvent, bool, error) {
@@ -769,22 +1117,44 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
 		return sseEvent{}, false, err
 	}
 	if outer.StatusCode >= 400 {
-		return sseEvent{}, false, fmt.Errorf("remote sse status %d", outer.StatusCode)
-	}
-	if outer.Body == "" {
-		return sseEvent{}, false, nil
+		return sseEvent{}, false, newUpstreamError(outer.StatusCode, outer.Body, sseResponseHeaders(outer.Headers))
 	}
 	if outer.Body == "[DONE]" {
 		return sseEvent{Done: true}, true, nil
 	}
+	innerPayload := outer.Body
+	if innerPayload == "" {
+		// Newer gateways may stream standard OpenAI frames without the COSY envelope.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &fields); err != nil {
+			return sseEvent{}, false, err
+		}
+		if _, choices := fields["choices"]; !choices {
+			if _, usage := fields["usage"]; !usage {
+				if _, upstreamError := fields["error"]; !upstreamError {
+					return sseEvent{}, false, nil
+				}
+			}
+		}
+		innerPayload = payload
+	}
 	var inner innerSSE
-	if err := json.Unmarshal([]byte(outer.Body), &inner); err != nil {
+	if err := json.Unmarshal([]byte(innerPayload), &inner); err != nil {
 		return sseEvent{}, false, err
 	}
+	if len(inner.Error) > 0 && string(inner.Error) != "null" {
+		return sseEvent{}, false, newUpstreamError(http.StatusBadGateway, string(inner.Error), nil)
+	}
 	var builder strings.Builder
+	var reasoningBuilder strings.Builder
 	var toolCalls []remoteToolCallFragment
+	usage := inner.Usage
 	for _, choice := range inner.Choices {
 		builder.WriteString(choice.Delta.Content)
+		reasoningBuilder.WriteString(choice.Delta.ReasoningContent)
+		if choice.Usage != nil {
+			usage = mergeRemoteUsage(choice.Usage, usage)
+		}
 		for _, tc := range choice.Delta.ToolCalls {
 			toolCalls = append(toolCalls, remoteToolCallFragment{
 				Index:             tc.Index,
@@ -795,7 +1165,7 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
 			})
 		}
 	}
-	return sseEvent{Content: builder.String(), ToolCalls: toolCalls}, true, nil
+	return sseEvent{Content: builder.String(), Reasoning: reasoningBuilder.String(), ToolCalls: toolCalls, Usage: usage}, true, nil
 }
 
 type remoteToolCallBuffer struct {
@@ -1372,12 +1742,42 @@ func isKnownEnterpriseRemoteHost(host string) bool {
 		strings.Contains(host, "qoder")
 }
 
+// estimateTokens approximates a tokenizer without shipping one: CJK and other
+// full-width scripts cost roughly one token per character while ASCII costs
+// roughly one token per four characters. It replaces a flat rune/N heuristic
+// that under-counted Chinese prompts by a factor of two or more.
 func estimateTokens(text string) int {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return 0
 	}
-	return len([]rune(text)) / 4
+	cjk := 0
+	ascii := 0
+	for _, r := range text {
+		if isWideRune(r) {
+			cjk++
+			continue
+		}
+		ascii++
+	}
+	keep := float64(cjk)*0.7 + float64(ascii)*0.25
+	return 1 + int(keep)
+}
+
+// isWideRune reports whether a rune belongs to a script that byte-pair
+// tokenizers usually emit as its own token.
+func isWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x11FF) ||
+		(r >= 0x2E80 && r <= 0x303F) ||
+		(r >= 0x3040 && r <= 0x30FF) ||
+		(r >= 0x3130 && r <= 0x318F) ||
+		(r >= 0x3400 && r <= 0x4DBF) ||
+		(r >= 0x4E00 && r <= 0x9FFF) ||
+		(r >= 0xA960 && r <= 0xA97F) ||
+		(r >= 0xAC00 && r <= 0xD7AF) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0xFF00 && r <= 0xFFEF) ||
+		(r >= 0x20000 && r <= 0x2FA1F)
 }
 
 func truncate(value string, max int) string {
