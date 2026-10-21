@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased (target: v1.6.12)
+## Unreleased (target: v1.6.13)
+
+## v1.6.13 - 2026-10-21
+
+- Restored the maintained features directly on the upstream v1.6.12 source tree: modern Windows QoderCN login, portable gateway credentials, complete model metadata and independent context/input limits.
+- Restored standard streaming usage, upstream token details, estimated-count attribution, request/session accounting, incremental reasoning/tool deltas and bounded tool repair.
+- Preserved upstream HTTP/SSE rate-limit details, Retry-After, bounded retries and configured model fallback without replay after output begins.
+- Added saved runtime strategy controls, zero/false persistence, close-to-tray, per-user login startup and isolated desktop config profiles.
+- Added reproducible Windows / Ubuntu 20.04 builds with WebKitGTK 4.0 and legacy AppIndicator; source, regressions and release configuration are tracked together.
+- 将完整应用源码直接纳入 Git；恢复新版认证、模型目录、usage/TPS、工具兼容、请求策略、托盘和自启动，并提供 Windows EXE 与 Ubuntu 20.04 DEB。
+
 
 ## v1.6.12 - 2026-06-10
 

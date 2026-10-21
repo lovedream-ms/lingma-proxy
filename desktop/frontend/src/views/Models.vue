@@ -103,7 +103,7 @@ onMounted(loadCachedModels)
       <div class="panel-header">
         <div>
           <h2>可用模型</h2>
-          <p>远端 API 模式推荐 Kimi-K2.6；MiniMax-M2.7 可作为速度优先备选。</p>
+          <p>模型、上下文和图像能力以当前账号返回的目录为准。</p>
         </div>
         <input v-model="query" class="search-input" type="search" placeholder="搜索模型" style="max-width: 260px" />
       </div>

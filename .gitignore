@@ -1,6 +1,6 @@
 bin/
 dist/
-lingma-ipc-proxy
+/lingma-ipc-proxy
 desktop/build/bin/
 desktop/frontend/dist/
 desktop/frontend/node_modules/
@@ -26,7 +26,8 @@ lingma-ipc-proxy.macos.json
 ITERATION.md
 
 # Local build tools and verification artifacts
-cache/
+cache/*
+!cache/go.mod
 toolchain/
 
 # Generated Wails resources and temporary Vite configuration

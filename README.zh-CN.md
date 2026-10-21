@@ -4,6 +4,10 @@
 
 **Lingma Proxy** 是一个通义灵码 / QoderCN API 适配层。它可以通过默认推荐的远端 API 模式直接调用远端接口，也可以把 Lingma / QoderCN 本地私有 IPC / WebSocket 能力转换成标准 **OpenAI 兼容接口** 和 **Anthropic 兼容接口**，让 Claude Code、Hermes、CodeBuddy、Codex CLI、OpenCode、自研 Agent 等第三方客户端可以直接调用后端模型。
 
+## 本地维护版构建与修复
+
+本仓库已直接跟踪完整应用源码。Windows / Ubuntu 20.04 的统一构建入口、安装方法、托盘、自启动和配置行为统一见 [主 README](README.md#windows--ubuntu-2004-maintained-build)；协议与 token 统计约定见 [usage 说明](docs/usage-reporting.md)。
+
 ## 模型可用性说明
 
 模型可用性并不是所有 Lingma 用户都完全一致。
@@ -49,7 +53,7 @@
 ## 当前版本
 
 <!-- VERSION:CURRENT:BEGIN -->
-当前桌面端版本：`v1.6.12`。
+当前桌面端版本：`v1.6.13`。
 
 唯一来源是 [VERSION](./VERSION)。执行 `./scripts/sync-version.sh` 会把它同步到 [desktop/wails.json](./desktop/wails.json)、桌面 UI 和面向发布的文档块。
 <!-- VERSION:CURRENT:END -->
