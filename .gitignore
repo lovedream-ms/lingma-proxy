@@ -27,7 +27,7 @@ lingma-ipc-proxy.macos.json
 ITERATION.md
 
 # Local build tools and verification artifacts
-cache/*
+cache/
 !cache/go.mod
 toolchain/
 
