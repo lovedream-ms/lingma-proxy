@@ -69,7 +69,7 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	svc := service.New(cfg)
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), cfg.WarmupTimeout)
 	if err := svc.Warmup(warmupCtx); err != nil {
 		log.Printf("warmup failed: %v", err)
 	} else {
@@ -465,20 +465,27 @@ func parseTransport(value string) lingmaipc.Transport {
 }
 
 func lookupArgValue(flagName string) string {
+	name := strings.TrimLeft(flagName, "-")
+	value := ""
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
-		if arg == flagName {
-			if i+1 < len(os.Args) {
-				return os.Args[i+1]
-			}
-			return ""
+		if arg == "--" {
+			break
 		}
-		prefix := flagName + "="
-		if strings.HasPrefix(arg, prefix) {
-			return strings.TrimPrefix(arg, prefix)
+		if arg == "-"+name || arg == "--"+name {
+			if i+1 < len(os.Args) {
+				i++
+				value = os.Args[i]
+			}
+			continue
+		}
+		for _, prefix := range []string{"-" + name + "=", "--" + name + "="} {
+			if strings.HasPrefix(arg, prefix) {
+				value = strings.TrimPrefix(arg, prefix)
+			}
 		}
 	}
-	return ""
+	return value
 }
 
 func envInt(key string, fallback int) int {
