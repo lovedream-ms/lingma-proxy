@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased (target: v1.6.13)
+## Unreleased (target: v1.6.14)
+
+## v1.6.14 - 2026-10-21
+
+- Detect repeated tool cycles of one to four calls when execution arguments and corresponding results remain unchanged; withhold the next duplicate, allow one correction, then reject persistent loops with non-retryable `tool_loop_detected` metadata.
+- Validate complete tool calls before emitting native tool fragments; preserve normal text streaming and apply the guard to Chat Completions, Responses, Anthropic Messages and IPC results.
+- Keep detection local to each request history, preserve new instructions and changing results, and provide bounded configurable allowances for named polling tools. Correction usage includes both attempts while context occupancy reflects the final attempt.
+- 新增 A/AB/ABC/ABCD 工具循环保护：结果不变时先纠偏一次，仍重复则阻止下发；保留正常进展、并行调用结果关联和有限轮询，避免跨子代理共享状态。
 
 ## v1.6.13 - 2026-10-21
 

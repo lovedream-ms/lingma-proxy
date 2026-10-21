@@ -24,8 +24,9 @@ import (
 type BackendMode string
 
 const (
-	BackendIPC    BackendMode = "ipc"
-	BackendRemote BackendMode = "remote"
+	StreamEventActivity             = "upstream_activity"
+	BackendIPC          BackendMode = "ipc"
+	BackendRemote       BackendMode = "remote"
 )
 
 type SessionMode string
@@ -81,6 +82,7 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
+	toolLoopCorrection  bool
 	AggregateToolStream *bool
 	StreamNativeTools   bool
 	Model               string
@@ -176,6 +178,7 @@ type State struct {
 }
 
 type Service struct {
+	toolLoopPolicy   toolLoopPolicy
 	cfg              Config
 	mu               sync.Mutex
 	client           *lingmaipc.Client
@@ -240,7 +243,7 @@ func New(cfg Config) *Service {
 	if cfg.SessionMode == "" {
 		cfg.SessionMode = SessionModeAuto
 	}
-	return &Service{cfg: cfg}
+	return &Service{cfg: cfg, toolLoopPolicy: newToolLoopPolicy()}
 }
 
 func DefaultRemoteFallbackModels() []string {
@@ -405,10 +408,7 @@ func (s *Service) Generate(ctx context.Context, req ChatRequest) (result *ChatRe
 		}
 	}()
 
-	if s.backend() == BackendRemote {
-		return s.generateRemote(ctx, req, nil)
-	}
-	return s.generateWithReconnect(ctx, req, nil)
+	return s.generateGuarded(ctx, req, nil)
 }
 
 func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan StreamEvent, <-chan StreamResult, error) {
@@ -419,11 +419,14 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 		started := time.Now()
 		var firstToken time.Time
 		streamedTokenEvents := 0
-		generate := s.generateWithReconnect
-		if s.backend() == BackendRemote {
-			generate = s.generateRemote
-		}
-		result, err := generate(ctx, req, func(event StreamEvent) {
+		result, err := s.generateGuarded(ctx, req, func(event StreamEvent) {
+			if event.Type == StreamEventActivity {
+				streamedTokenEvents++
+				if firstToken.IsZero() {
+					firstToken = time.Now()
+				}
+				return
+			}
 			if event.Delta == "" && event.ToolDelta == nil {
 				return
 			}
@@ -596,8 +599,8 @@ func (s *Service) generateRemoteWithModel(
 	var toolDelta func(remote.ToolCallFragment)
 	if onDelta != nil && req.StreamNativeTools {
 		toolDelta = func(call remote.ToolCallFragment) {
-			emitted = true
-			onDelta(StreamEvent{Type: StreamEventTool, ToolDelta: &call})
+			// Record real upstream timing without releasing executable fragments.
+			onDelta(StreamEvent{Type: StreamEventActivity})
 		}
 	}
 	remoteResult, err := client.Chat(ctx, remote.ChatRequest{
@@ -620,7 +623,7 @@ func (s *Service) generateRemoteWithModel(
 		normalizeErr := normalizeRemoteToolResult(req, remoteResult)
 		needsRetry := normalizeErr != nil || (len(remoteResult.ToolCalls) == 0 &&
 			shouldRetryRemoteNativeTool(req, remoteResult.Text))
-		if needsRetry && !emitted && req.ToolChoice.Mode != "none" {
+		if needsRetry && !emitted && req.ToolChoice.Mode != "none" && !req.toolLoopCorrection {
 			repairPrompt, promptErr := buildLingmaPrompt(req, SessionModeFresh, true)
 			if promptErr != nil {
 				return nil, emitted, promptErr
@@ -1662,6 +1665,9 @@ func (s *Service) deleteSessionLocked(ctx context.Context, client *lingmaipc.Cli
 }
 
 func resolveSessionMode(req ChatRequest, configured SessionMode) SessionMode {
+	if req.toolLoopCorrection {
+		return SessionModeFresh
+	}
 	if configured != SessionModeAuto {
 		return configured
 	}

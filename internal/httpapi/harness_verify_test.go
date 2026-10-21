@@ -112,12 +112,12 @@ func TestVerifyHarnessNativeFragmentRepairAndHistory(t *testing.T) {
 	}
 }
 
-func TestVerifyHarnessMalformedStreamStopsWithoutReplay(t *testing.T) {
+func TestVerifyHarnessMalformedStreamRepairIsBoundedBeforeEmission(t *testing.T) {
 	s, count := verifyHarnessServer(t, func(n int, payload map[string]any) []map[string]any {
 		return []map[string]any{verifyDelta(map[string]any{"tool_calls": []any{map[string]any{"index": 0, "function": map[string]any{"name": "run_code", "arguments": `{"code":4}`}}}})}
 	})
 	body := verifyHarnessRequestBody(t, s, verifyHarnessRequest)
-	if count.Load() != 1 || !strings.Contains(body, `"error"`) || strings.Contains(body, `"finish_reason":"stop"`) || !strings.Contains(body, "[DONE]") {
+	if count.Load() != 2 || !strings.Contains(body, `"error"`) || strings.Contains(body, `"tool_calls"`) || strings.Contains(body, `"finish_reason":"stop"`) || !strings.Contains(body, "[DONE]") {
 		t.Fatalf("bad call was silently accepted or retried unboundedly: count=%d %s", count.Load(), body)
 	}
 }

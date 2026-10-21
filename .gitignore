@@ -21,6 +21,7 @@ coverage.*
 nul
 LINUXDO_POST.md
 lingma-ipc-proxy.macos.json
+.agent-teams
 
 # Local iteration doc (not for git)
 ITERATION.md

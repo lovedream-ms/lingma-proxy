@@ -17,7 +17,7 @@ This checkout tracks the complete application source directly. Build with PowerS
 .\scripts\build-all.ps1 -Target Headless   # Console binary in cache/build
 ```
 
-The entry point downloads checksum-verified Go 1.23.6 and Node 20.20.2 into `cache/toolchain` and installs the pinned Wails CLI. Linux builds require an existing WSL distribution (default `Ubuntu-24.04`, selectable with `-Distro`) and prepare an isolated Focal rootfs. Native Focal builds use `scripts/build-ubuntu2004-gui.sh`. The GUI retains DevTools and links WebKitGTK 4.0 and legacy AppIndicator. Full builds publish exactly one Windows EXE and one Linux DEB to `dist`; intermediate material stays in `cache`. `-SkipFrontend` reuses previously built assets. Install the DEB with `sudo apt install --fix-broken ./dist/lingma-proxy-desktop-ubuntu20.04_1.6.13_amd64.deb`.
+The entry point downloads checksum-verified Go 1.23.6 and Node 20.20.2 into `cache/toolchain` and installs the pinned Wails CLI. Linux builds require an existing WSL distribution (default `Ubuntu-24.04`, selectable with `-Distro`) and prepare an isolated Focal rootfs. Native Focal builds use `scripts/build-ubuntu2004-gui.sh`. The GUI retains DevTools and links WebKitGTK 4.0 and legacy AppIndicator. Full builds publish exactly one Windows EXE and one Linux DEB to `dist`; intermediate material stays in `cache`. `-SkipFrontend` reuses previously built assets. Install the DEB with `sudo apt install --fix-broken ./dist/lingma-proxy-desktop-ubuntu20.04_1.6.14_amd64.deb`.
 
 Closing the desktop window keeps the proxy serving; use the tray to restore or explicitly quit. Linux without a tray host minimizes to the taskbar. Login autostart is a separate user setting. Settings expose the default model, concurrency (1–16), remote retries (0–10), backoff and tool stream compatibility. Explicit zero/false settings survive restart and server-bundle export. No extra system service is required.
 
@@ -66,7 +66,7 @@ Auto-detection prefers QoderCN runtime files first, then falls back to Lingma ru
 ## Current Version
 
 <!-- VERSION:CURRENT:BEGIN -->
-Current desktop app version: `v1.6.13`.
+Current desktop app version: `v1.6.14`.
 
 The canonical source is [VERSION](./VERSION). Run `./scripts/sync-version.sh` to propagate it into [desktop/wails.json](./desktop/wails.json), the desktop UI, and release-facing docs.
 <!-- VERSION:CURRENT:END -->

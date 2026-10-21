@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,8 +19,28 @@ import (
 	"lingma-ipc-proxy/internal/service"
 )
 
-func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
+type observedToolWriter struct {
+	http.ResponseWriter
+	tools chan struct{}
+}
+
+func (w observedToolWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"tool_calls"`)) {
+		select {
+		case w.tools <- struct{}{}:
+		default:
+		}
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w observedToolWriter) Flush() { w.ResponseWriter.(http.Flusher).Flush() }
+
+func TestVerifyNativeToolsWaitForCompleteValidation(t *testing.T) {
+	t.Setenv("LINGMA_AGGREGATE_TOOL_STREAM", "false")
 	release := make(chan struct{})
+	partialWritten := make(chan struct{})
+	toolsObserved := make(chan struct{}, 4)
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
@@ -33,6 +54,7 @@ func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
 		encoded, _ := json.Marshal(first)
 		fmt.Fprintf(w, "data: %s\n\n", encoded)
 		w.(http.Flusher).Flush()
+		close(partialWritten)
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -52,7 +74,10 @@ func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
 	if _, err := svc.ListModels(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	proxy := httptest.NewServer(NewServer("", svc).http.Handler)
+	handler := NewServer("", svc).http.Handler
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(observedToolWriter{ResponseWriter: w, tools: toolsObserved}, r)
+	}))
 	defer proxy.Close()
 	// Unblock the upstream before closing servers, including on assertion failure.
 	defer unblock()
@@ -62,6 +87,13 @@ func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
+	<-partialWritten
+	select {
+	case <-toolsObserved:
+		t.Fatal("unvalidated partial tool call escaped before upstream completion")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
 	scanner := bufio.NewScanner(response.Body)
 	var arguments strings.Builder
 	var usage map[string]any
@@ -88,9 +120,6 @@ func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
 			for _, call := range choice.Delta.ToolCalls {
 				toolFrames++
 				arguments.WriteString(call.Function.Arguments)
-				if call.Function.Name == "run_code" {
-					unblock()
-				}
 			}
 		}
 		if frame.Usage != nil {
@@ -98,13 +127,16 @@ func TestVerifyNativeToolsArriveBeforeUpstreamCompletes(t *testing.T) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		t.Fatalf("first tool fragment was buffered until completion: %v", err)
+		t.Fatalf("validated stream did not complete: %v", err)
 	}
-	if toolFrames != 2 || arguments.String() != `{"code":"console.log(1)"}` {
+	if toolFrames != 1 || arguments.String() != `{"code":"console.log(1)"}` {
 		t.Fatalf("tool arguments duplicated or lost: frames=%d arguments=%q", toolFrames, arguments.String())
 	}
 	if usage["prompt_tokens"] != float64(1200) || usage["completion_tokens"] != float64(40) {
 		t.Fatalf("request counts lost: %v", usage)
+	}
+	if _, ok := usage["output_speed_tokens_per_second"]; !ok {
+		t.Fatalf("buffering discarded real upstream timing: %v", usage)
 	}
 	occupancy, _ := usage["context_window"].(map[string]any)
 	if occupancy["used_tokens"] != float64(1240) || occupancy["limit_tokens"] != float64(200000) || occupancy["source"] != "estimated" {

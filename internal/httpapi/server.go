@@ -2406,6 +2406,15 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func upstreamAPIErrorPayload(err error) map[string]any {
 	payload := map[string]any{"type": "api_error", "message": err.Error(), "code": nil, "param": nil}
+	var loop *service.ToolLoopError
+	if errors.As(err, &loop) {
+		payload["type"] = "invalid_request_error"
+		payload["code"] = "tool_loop_detected"
+		payload["retryable"] = false
+		payload["period"] = loop.Period
+		payload["repetitions"] = loop.Repeats
+		return payload
+	}
 	var upstream *remote.UpstreamError
 	if errors.As(err, &upstream) {
 		payload["status"] = upstream.StatusCode
@@ -2425,6 +2434,10 @@ func upstreamAPIErrorPayload(err error) map[string]any {
 
 func writeUpstreamAPIError(w http.ResponseWriter, err error, anthropic bool) {
 	status := http.StatusInternalServerError
+	var loop *service.ToolLoopError
+	if errors.As(err, &loop) {
+		status = http.StatusBadRequest
+	}
 	var upstream *remote.UpstreamError
 	if errors.As(err, &upstream) {
 		if upstream.StatusCode >= 400 && upstream.StatusCode <= 599 {
