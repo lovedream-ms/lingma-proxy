@@ -28,3 +28,7 @@ ITERATION.md
 # Local build tools and verification artifacts
 cache/
 toolchain/
+
+# Generated Wails resources and temporary Vite configuration
+*.syso
+desktop/frontend/vite.config.*.timestamp-*.mjs

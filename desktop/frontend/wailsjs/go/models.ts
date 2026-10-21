@@ -126,6 +126,11 @@ export namespace main {
 	}
 	export class ModelInfo {
 	    id: string;
+	    context_window: number;
+	    max_context_length: number;
+	    context_options: number[];
+	    supports_vision: boolean | null;
+	    input_modalities: string[];
 	    name: string;
 
 	    static createFrom(source: any = {}) {
@@ -135,6 +140,11 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
+	        this.context_window = source["context_window"];
+	        this.max_context_length = source["max_context_length"];
+	        this.context_options = source["context_options"];
+	        this.supports_vision = source["supports_vision"];
+	        this.input_modalities = source["input_modalities"];
 	        this.name = source["name"];
 	    }
 	}
@@ -274,6 +284,10 @@ export namespace main {
 export namespace service {
 
 	export class Config {
+	    MaxConcurrentRequests: number;
+	    RemoteRetryCount: number | null;
+	    RemoteRetryBaseDelayMS: number;
+	    AggregateToolStream: boolean | null;
 	    Host: string;
 	    Port: number;
 	    Backend: string;
@@ -293,6 +307,7 @@ export namespace service {
 	    Timeout: number;
 	    WarmupTimeout: number;
 	    RemoteFallbackEnabled: boolean;
+	    AutoStartOnBoot: boolean;
 	    RemoteFallbackModels: string[];
 
 	    static createFrom(source: any = {}) {
@@ -301,6 +316,10 @@ export namespace service {
 
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.MaxConcurrentRequests = source["MaxConcurrentRequests"];
+	        this.RemoteRetryCount = source["RemoteRetryCount"];
+	        this.RemoteRetryBaseDelayMS = source["RemoteRetryBaseDelayMS"];
+	        this.AggregateToolStream = source["AggregateToolStream"];
 	        this.Host = source["Host"];
 	        this.Port = source["Port"];
 	        this.Backend = source["Backend"];
@@ -320,6 +339,7 @@ export namespace service {
 	        this.Timeout = source["Timeout"];
 	        this.WarmupTimeout = source["WarmupTimeout"];
 	        this.RemoteFallbackEnabled = source["RemoteFallbackEnabled"];
+	        this.AutoStartOnBoot = source["AutoStartOnBoot"];
 	        this.RemoteFallbackModels = source["RemoteFallbackModels"];
 	    }
 	}

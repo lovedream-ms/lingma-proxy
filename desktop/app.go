@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -12,12 +13,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"lingma-ipc-proxy/desktop/autostart"
 	"lingma-ipc-proxy/internal/deploy"
 	"lingma-ipc-proxy/internal/httpapi"
 	"lingma-ipc-proxy/internal/lingmaipc"
@@ -105,30 +108,15 @@ type TokenStats struct {
 	LastUpdated     string         `json:"lastUpdated,omitempty"`
 }
 
-type App struct {
-	ctx context.Context
-
-	mu        sync.RWMutex
-	cfg       service.Config
-	server    *httpapi.Server
-	running   bool
-	quitting  bool
-	addr      string
-	startedAt time.Time
-	quitHint  time.Time
-	models    []ModelInfo
-	requests  []RequestRecord
-	logs      []AppLog
-	stats     TokenStats
-
-	stateFlushTimer *time.Timer
-	stateFlushAt    time.Time
-}
-
 // ModelInfo represents a model returned by /v1/models
 type ModelInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ContextWindow    int      `json:"context_window"`
+	MaxContextLength int      `json:"max_context_length"`
+	ContextOptions   []int    `json:"context_options,omitempty"`
+	SupportsVision   *bool    `json:"supports_vision"`
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
 }
 
 // ProxyStatus represents the current proxy status
@@ -139,6 +127,25 @@ type ProxyStatus struct {
 	Models    int    `json:"models"`
 	Model     string `json:"model,omitempty"`
 	StartedAt string `json:"startedAt,omitempty"`
+}
+
+// App struct
+type App struct {
+	ctx             context.Context
+	cfg             service.Config
+	mu              sync.RWMutex
+	running         bool
+	addr            string
+	startedAt       time.Time
+	models          []ModelInfo
+	server          *httpapi.Server
+	requests        []RequestRecord
+	logs            []AppLog
+	stats           TokenStats
+	quitting        bool
+	stateFlushTimer *time.Timer
+	stateFlushAt    time.Time
+	autostarter     autostart.Autostarter
 }
 
 // DetectionInfo exposes non-sensitive resolved connection details for the UI.
@@ -210,13 +217,20 @@ type feedbackZipEntry struct {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{}
+	a := &App{}
+	if executable, err := os.Executable(); err == nil {
+		a.autostarter = autostart.New("LingmaProxy", executable)
+	}
+	return a
 }
 
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.cfg = defaultConfig()
+	if err := a.applyAutoStart(a.cfg.AutoStartOnBoot); err != nil {
+		runtime.LogWarningf(a.ctx, "failed to configure login startup: %v", err)
+	}
 	if err := a.loadAppState(); err != nil {
 		runtime.LogWarningf(a.ctx, "failed to load app state: %v", err)
 	}
@@ -247,32 +261,15 @@ func (a *App) onSecondInstanceLaunch(secondInstanceData options.SecondInstanceDa
 	a.ShowWindow()
 }
 
-// beforeClose hides the window by default so the proxy can keep running.
-// QuitApp sets quitting=true before allowing the process to exit.
+// Closing the window leaves the proxy running; explicit Quit stops the app.
 func (a *App) beforeClose(ctx context.Context) bool {
-	if goruntime.GOOS == "linux" {
-		go a.forceQuit()
-		return true
-	}
-
 	a.mu.Lock()
-	if a.quitting {
-		a.mu.Unlock()
-		return true
-	}
-
-	now := time.Now()
-	if !a.quitHint.IsZero() && now.Sub(a.quitHint) <= 2*time.Second {
-		a.mu.Unlock()
-		go a.forceQuit()
-		return true
-	}
-	a.quitHint = now
+	quitting := a.quitting
 	a.mu.Unlock()
-
-	message := "再按一次退出快捷键将停止代理并退出应用"
-	a.emitLog("warn", message)
-	runtime.EventsEmit(a.ctx, "quit:confirm", message)
+	if quitting {
+		return false
+	}
+	a.HideWindow()
 	return true
 }
 
@@ -285,7 +282,7 @@ func (a *App) ShowWindow() {
 
 // HideWindow hides the main window
 func (a *App) HideWindow() {
-	runtime.Hide(a.ctx)
+	hideDesktopWindow(a.ctx)
 }
 
 // MinimizeWindow minimises the main window.
@@ -338,6 +335,7 @@ func (a *App) forceQuit() {
 	case <-time.After(1200 * time.Millisecond):
 		runtime.LogWarning(a.ctx, "force quit continuing before proxy shutdown completed")
 	}
+	stopDesktopTray()
 	os.Exit(0)
 }
 
@@ -455,6 +453,10 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 // UpdateConfig updates the configuration, saves to file, and restarts the proxy if running.
 // Frontend sends Timeout in seconds; we convert to time.Duration.
 func (a *App) UpdateConfig(cfg service.Config) error {
+	cfg = service.NormalizeRuntimeSettings(cfg)
+	if err := cfg.ValidateRuntimeSettings(); err != nil {
+		return err
+	}
 	if err := remote.ValidateProxyURL(cfg.RemoteProxyURL); err != nil {
 		return err
 	}
@@ -469,17 +471,23 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 		cfg.WarmupTimeout = proxyWarmupTimeout
 	}
 
-	a.mu.Lock()
+	a.mu.RLock()
+	previousConfig := a.cfg
 	wasRunning := a.running
+	a.mu.RUnlock()
+	if err := a.applyAutoStart(cfg.AutoStartOnBoot); err != nil {
+		return fmt.Errorf("configure login startup: %w", err)
+	}
+	if err := a.saveConfig(cfg); err != nil {
+		if rollbackErr := a.applyAutoStart(previousConfig.AutoStartOnBoot); rollbackErr != nil {
+			return fmt.Errorf("save config: %v; restore login startup: %w", err, rollbackErr)
+		}
+		return fmt.Errorf("save config: %w", err)
+	}
+	a.mu.Lock()
 	a.cfg = cfg
 	a.mu.Unlock()
-
-	if err := a.saveConfig(cfg); err != nil {
-		runtime.LogWarningf(a.ctx, "failed to save config: %v", err)
-		a.emitLog("warn", fmt.Sprintf("Config updated but failed to save: %v", err))
-	} else {
-		a.emitLog("info", "Config saved to file")
-	}
+	a.emitLog("info", "Config saved to file")
 
 	if wasRunning {
 		if err := a.StopProxy(); err != nil {
@@ -490,46 +498,80 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 	return nil
 }
 
+func (a *App) applyAutoStart(enabled bool) error {
+	if a.autostarter == nil {
+		if !enabled {
+			return nil
+		}
+		return fmt.Errorf("cannot resolve executable for login startup")
+	}
+	if enabled {
+		// Refresh the executable path after an application upgrade or move.
+		return a.autostarter.Enable()
+	}
+	registered, err := a.autostarter.IsEnabled()
+	if err != nil || !registered {
+		return err
+	}
+	return a.autostarter.Disable()
+}
+
 func (a *App) saveConfig(cfg service.Config) error {
-	home, err := os.UserHomeDir()
+	path, err := configSavePath()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(home, ".config", "lingma-proxy")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 
 	timeoutSec := int(cfg.Timeout.Seconds())
 	fileCfg := map[string]any{
-		"host":                    cfg.Host,
-		"port":                    cfg.Port,
-		"backend":                 string(cfg.Backend),
-		"transport":               string(cfg.Transport),
-		"pipe":                    cfg.Pipe,
-		"websocket_url":           cfg.WebSocketURL,
-		"remote_base_url":         cfg.RemoteBaseURL,
-		"remote_auth_file":        cfg.RemoteAuthFile,
-		"remote_proxy_url":        cfg.RemoteProxyURL,
-		"remote_version":          cfg.RemoteVersion,
-		"cwd":                     cfg.Cwd,
-		"current_file_path":       cfg.CurrentFilePath,
-		"mode":                    cfg.Mode,
-		"model":                   cfg.Model,
-		"shell_type":              cfg.ShellType,
-		"session_mode":            string(cfg.SessionMode),
-		"timeout":                 timeoutSec,
-		"warmup_timeout":          int(cfg.WarmupTimeout.Seconds()),
-		"remote_fallback_enabled": cfg.RemoteFallbackEnabled,
-		"remote_fallback_models":  cfg.RemoteFallbackModels,
+		"host":                       cfg.Host,
+		"port":                       cfg.Port,
+		"backend":                    string(cfg.Backend),
+		"transport":                  string(cfg.Transport),
+		"pipe":                       cfg.Pipe,
+		"websocket_url":              cfg.WebSocketURL,
+		"remote_base_url":            cfg.RemoteBaseURL,
+		"remote_auth_file":           cfg.RemoteAuthFile,
+		"remote_proxy_url":           cfg.RemoteProxyURL,
+		"remote_version":             cfg.RemoteVersion,
+		"cwd":                        cfg.Cwd,
+		"current_file_path":          cfg.CurrentFilePath,
+		"mode":                       cfg.Mode,
+		"model":                      cfg.Model,
+		"shell_type":                 cfg.ShellType,
+		"session_mode":               string(cfg.SessionMode),
+		"timeout":                    timeoutSec,
+		"warmup_timeout":             int(cfg.WarmupTimeout.Seconds()),
+		"remote_fallback_enabled":    cfg.RemoteFallbackEnabled,
+		"remote_fallback_models":     cfg.RemoteFallbackModels,
+		"auto_start_on_boot":         cfg.AutoStartOnBoot,
+		"max_concurrent_requests":    cfg.MaxConcurrentRequests,
+		"remote_retry_count":         cfg.RemoteRetryCount,
+		"remote_retry_base_delay_ms": cfg.RemoteRetryBaseDelayMS,
+		"aggregate_tool_stream":      cfg.AggregateToolStream,
 	}
 
-	data, err := json.MarshalIndent(fileCfg, "", "  ")
+	// Preserve configuration fields not managed by the current UI version.
+	existing := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return fmt.Errorf("read existing config: %w", err)
+		}
+	}
+	if existing == nil {
+		existing = map[string]any{}
+	}
+	for key, value := range fileCfg {
+		existing[key] = value
+	}
+	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	path := filepath.Join(dir, "config.json")
 	return os.WriteFile(path, data, 0644)
 }
 
@@ -856,6 +898,7 @@ func (a *App) ExportServerDeploymentBundle(options ServerDeploymentExportOptions
 		host = "0.0.0.0"
 	}
 	bundle, err := deploy.WriteServerBundle(deploy.ServerBundleOptions{
+		RuntimeConfig: &cfg,
 		AuthFile:      cfg.RemoteAuthFile,
 		OutputPath:    savePath,
 		PickPolicy:    policy,
@@ -1142,20 +1185,14 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 	defer resp.Body.Close()
 
 	var result struct {
-		Data []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"data"`
+		Data []ModelInfo `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		runtime.LogWarningf(a.ctx, "decode models failed: %v", err)
 		return nil, err
 	}
 
-	models := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		models = append(models, ModelInfo{ID: m.ID, Name: m.Name})
-	}
+	models := result.Data
 
 	a.mu.Lock()
 	changed := !sameModelList(a.models, models)
@@ -1175,15 +1212,7 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 }
 
 func sameModelList(left, right []ModelInfo) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i].ID != right[i].ID || left[i].Name != right[i].Name {
-			return false
-		}
-	}
-	return true
+	return reflect.DeepEqual(left, right)
 }
 
 func extractRequestModel(reqBody string) string {
@@ -1366,7 +1395,26 @@ func summarizeLogEntry(entry AppLog) AppLog {
 	return cloned
 }
 
+// Explicit config profiles keep their single-instance lock and UI cache separate.
+func desktopInstanceID() string {
+	path := strings.TrimSpace(os.Getenv("LINGMA_PROXY_CONFIG"))
+	if path == "" {
+		return "lingma-proxy-desktop"
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	if goruntime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return fmt.Sprintf("lingma-proxy-desktop-%x", sha256.Sum256([]byte(filepath.Clean(path))))
+}
+
 func appStatePath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("LINGMA_PROXY_CONFIG")); path != "" {
+		absolute, err := filepath.Abs(path)
+		return absolute + ".state.json", err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -1496,8 +1544,19 @@ func findUsageTokens(value any) (int, int, bool) {
 }
 
 func usageTokenPair(value map[string]any) (int, int, bool) {
-	input := intFromAny(value["input_tokens"]) + intFromAny(value["prompt_tokens"])
-	output := intFromAny(value["output_tokens"]) + intFromAny(value["completion_tokens"])
+	inputValue, inputKnown := value["input_tokens"]
+	if !inputKnown {
+		inputValue, inputKnown = value["prompt_tokens"]
+	}
+	outputValue, outputKnown := value["output_tokens"]
+	if !outputKnown {
+		outputValue, outputKnown = value["completion_tokens"]
+	}
+	input := max(0, intFromAny(inputValue))
+	output := max(0, intFromAny(outputValue))
+	if inputKnown || outputKnown {
+		return input, output, true
+	}
 	if input > 0 || output > 0 {
 		return input, output, true
 	}
@@ -1823,6 +1882,7 @@ func buildConfigSummary(cfg service.Config, stats TokenStats, status ProxyStatus
 		"warmupTimeoutSeconds":  int(effectiveWarmupTimeout(cfg).Seconds()),
 		"remoteFallbackEnabled": cfg.RemoteFallbackEnabled,
 		"remoteFallbackModels":  cleanConfigStrings(cfg.RemoteFallbackModels),
+		"autoStartOnBoot":       cfg.AutoStartOnBoot,
 		"statusRunning":         status.Running,
 		"statusStartedAt":       status.StartedAt,
 		"tokenTotalRequests":    stats.TotalRequests,
@@ -2086,6 +2146,7 @@ func defaultConfig() service.Config {
 		if info, err := os.Stat(configPath); err == nil && !info.IsDir() {
 			if data, err := os.ReadFile(configPath); err == nil {
 				var fileCfg struct {
+					service.RuntimeSettingsFile
 					Host                  string   `json:"host"`
 					Port                  int      `json:"port"`
 					Backend               string   `json:"backend"`
@@ -2106,8 +2167,10 @@ func defaultConfig() service.Config {
 					WarmupTimeoutSeconds  int      `json:"warmup_timeout"`
 					RemoteFallbackEnabled *bool    `json:"remote_fallback_enabled"`
 					RemoteFallbackModels  []string `json:"remote_fallback_models"`
+					AutoStartOnBoot       bool     `json:"auto_start_on_boot"`
 				}
 				if err := json.Unmarshal(data, &fileCfg); err == nil {
+					fileCfg.RuntimeSettingsFile.Apply(&cfg)
 					if fileCfg.Host != "" {
 						cfg.Host = fileCfg.Host
 					}
@@ -2170,13 +2233,14 @@ func defaultConfig() service.Config {
 					if len(fileCfg.RemoteFallbackModels) > 0 {
 						cfg.RemoteFallbackModels = cleanConfigStrings(fileCfg.RemoteFallbackModels)
 					}
+					cfg.AutoStartOnBoot = fileCfg.AutoStartOnBoot
 				}
 				break // loaded successfully
 			}
 		}
 	}
 
-	return cfg
+	return service.NormalizeRuntimeSettings(cfg)
 }
 
 func backendLabel(backend service.BackendMode) string {
@@ -2214,7 +2278,26 @@ func cleanConfigStrings(values []string) []string {
 	return out
 }
 
+func configSavePath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("LINGMA_PROXY_CONFIG")); path != "" {
+		return path, nil
+	}
+	for _, path := range configSearchPaths() {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "lingma-proxy", "config.json"), nil
+}
+
 func configSearchPaths() []string {
+	if path := strings.TrimSpace(os.Getenv("LINGMA_PROXY_CONFIG")); path != "" {
+		return []string{path}
+	}
 	var paths []string
 	// 1. Executable directory (for dev / portable mode)
 	if exe, err := os.Executable(); err == nil {

@@ -65,8 +65,10 @@ function Build-Frontend {
   if (-not $SkipFrontend) {
     Push-Location $frontend
     try {
-      & npm.cmd install --package-lock-only --ignore-scripts
-      if ($LASTEXITCODE -ne 0) { throw 'npm lock generation failed' }
+      if (-not (Test-Path -LiteralPath (Join-Path $frontend 'package-lock.json'))) {
+        & npm.cmd install --package-lock-only --ignore-scripts
+        if ($LASTEXITCODE -ne 0) { throw 'npm lock generation failed' }
+      }
       & npm.cmd ci
       if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
       & npm.cmd run build
@@ -110,9 +112,12 @@ function Build-Linux([string]$Destination) {
   $dependencyPath = $AppIndicatorDeb
   if (-not $dependencyPath) { $dependencyPath = Join-Path $cacheDir $dependencyName }
   if (-not (Test-Path -LiteralPath $dependencyPath)) {
-    Invoke-WebRequest -Uri "https://archive.ubuntu.com/ubuntu/pool/universe/liba/libappindicator/$dependencyName" -OutFile $dependencyPath
+    Invoke-WebRequest -Uri "https://archive.ubuntu.com/ubuntu/pool/main/liba/libappindicator/$dependencyName" -OutFile $dependencyPath
   }
   $dependencyPath = (Resolve-Path -LiteralPath $dependencyPath).Path
+  if ((Get-FileHash -LiteralPath $dependencyPath -Algorithm SHA256).Hash -ne '79ba13d134a2b776f2eac5ba03d2b00dcd06d3489264c7e50f37af631e53c3f1') {
+    throw 'Unexpected Focal AppIndicator dependency SHA256'
+  }
   $archive = Join-Path $cacheDir ('source-' + [guid]::NewGuid().ToString('N') + '.tar.gz')
   $archiveWsl = Convert-ToWslPath $archive
   $sourceWsl = Convert-ToWslPath $Source

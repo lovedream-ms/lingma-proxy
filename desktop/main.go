@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"os"
 	goruntime "runtime"
@@ -20,6 +21,8 @@ var devtoolsBuild = "false"
 
 func main() {
 	app := NewApp()
+	ready := make(chan struct{})
+	startDesktopTray(app, ready)
 	openInspectorOnStartup := os.Getenv("LINGMA_DESKTOP_DEBUG") == "1"
 	enableInspector := openInspectorOnStartup || devtoolsBuild == "true"
 
@@ -29,7 +32,7 @@ func main() {
 		Height:            defaultWindowHeight(),
 		MinWidth:          900,
 		MinHeight:         600,
-		HideWindowOnClose: goruntime.GOOS != "linux",
+		HideWindowOnClose: false,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
@@ -39,11 +42,14 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 238, G: 243, B: 248, A: 255},
 		Menu:             appMenu(app),
-		OnStartup:        app.startup,
-		OnBeforeClose:    app.beforeClose,
-		OnDomReady:       app.onDomReady,
+		OnStartup: func(ctx context.Context) {
+			app.startup(ctx)
+			close(ready)
+		},
+		OnBeforeClose: app.beforeClose,
+		OnDomReady:    app.onDomReady,
 		SingleInstanceLock: &options.SingleInstanceLock{
-			UniqueId:               "lingma-proxy-desktop",
+			UniqueId:               desktopInstanceID(),
 			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
 		},
 		Bind: []interface{}{

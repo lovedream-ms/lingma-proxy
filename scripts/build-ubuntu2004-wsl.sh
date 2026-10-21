@@ -1,6 +1,7 @@
 #!/bin/bash
 # Windows invokes this helper as root inside an existing Ubuntu WSL distro.
 set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 source_archive=${1:?Missing source archive}
 output_dir=${2:?Missing output directory}
 recipe=${3:?Missing package recipe}
@@ -18,6 +19,7 @@ cleanup() {
   for ((i=${#owned_mounts[@]}-1; i>=0; i--)); do umount "${owned_mounts[i]}"; done
 }
 trap cleanup EXIT
+printf '%s  %s\n' 79ba13d134a2b776f2eac5ba03d2b00dcd06d3489264c7e50f37af631e53c3f1 "$appindicator_deb" | sha256sum -c -
 test "$(dpkg-deb -f "$appindicator_deb" Package)" = libappindicator3-1
 test "$(dpkg-deb -f "$appindicator_deb" Version)" = 12.10.1+20.04.20200408.1-0ubuntu1
 test "$(dpkg-deb -f "$appindicator_deb" Architecture)" = amd64

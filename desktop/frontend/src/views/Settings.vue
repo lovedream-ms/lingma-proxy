@@ -1,10 +1,11 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { ExportServerDeploymentBundle, GetConfig, GetDetectionInfo, OpenPathInFileManager, UpdateConfig } from '../../wailsjs/go/main/App.js'
+import { ExportServerDeploymentBundle, GetConfig, GetModels, GetDetectionInfo, OpenPathInFileManager, UpdateConfig } from '../../wailsjs/go/main/App.js'
 
 const emit = defineEmits(['log', 'status-refresh'])
 
 const config = ref({})
+const models = ref([])
 const detection = ref(null)
 const saving = ref(false)
 const exportingBundle = ref(false)
@@ -95,6 +96,7 @@ function formatDateTime(value) {
 onMounted(async () => {
   try {
     config.value = await GetConfig()
+    models.value = await GetModels().catch(() => [])
     fallbackModelsText.value = Array.isArray(config.value.RemoteFallbackModels)
       ? config.value.RemoteFallbackModels.join('\n')
       : ''
@@ -237,6 +239,16 @@ async function openBundleFolder() {
           </div>
           <div class="field span-2 switch-field">
             <div>
+              <label for="auto-start-on-boot">开机自动启动</label>
+              <p>登录系统后自动启动桌面代理，保存设置后生效。</p>
+            </div>
+            <label class="switch">
+              <input id="auto-start-on-boot" v-model="config.AutoStartOnBoot" type="checkbox" />
+              <span></span>
+            </label>
+          </div>
+          <div class="field span-2 switch-field">
+            <div>
               <label>远端超时兜底</label>
               <p>设置正数超时后，远端 API 超时、限流或 5xx 且尚未流式输出时，自动切换到下一个可用模型。</p>
             </div>
@@ -372,6 +384,57 @@ async function openBundleFolder() {
               </dd>
             </div>
           </dl>
+        </div>
+      </div>
+
+      <div class="glass-panel">
+        <div class="panel-header">
+          <div>
+            <h2>模型与请求策略</h2>
+            <p>直接调整并发和重试；保存后重启代理生效。</p>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="field span-2">
+            <label for="default-model">默认模型</label>
+            <input id="default-model" v-model="config.Model" list="settings-models" type="text" placeholder="选择或输入模型 ID" />
+            <datalist id="settings-models">
+              <option v-for="model in models" :key="model.id" :value="model.id">{{ model.name }}</option>
+            </datalist>
+            <small>客户端未指定模型时使用。候选列表来自模型页的最近一次探测。</small>
+          </div>
+          <div class="field">
+            <label for="max-concurrent">最大并发请求数</label>
+            <input id="max-concurrent" v-model.number="config.MaxConcurrentRequests" type="number" min="1" max="16" step="1" />
+            <small>默认 4，可设 1–16；超出数量的请求排队等待。</small>
+          </div>
+        </div>
+        <fieldset class="settings-fieldset" :disabled="isIPCBackend">
+          <div class="form-grid">
+            <div class="field">
+              <label for="retry-count">远程 429 重试次数</label>
+              <input id="retry-count" v-model.number="config.RemoteRetryCount" type="number" min="0" max="10" step="1" />
+              <small>仅远程模式；0 表示不重试，默认 3 次。</small>
+            </div>
+            <div class="field">
+              <label for="retry-delay">初始退避时间（毫秒）</label>
+              <input id="retry-delay" v-model.number="config.RemoteRetryBaseDelayMS" type="number" min="100" max="60000" step="100" />
+              <small>默认 1000；后续指数递增并加入抖动，遵守上游等待指令。</small>
+            </div>
+          </div>
+        </fieldset>
+        <div class="field span-2 switch-field">
+          <div>
+            <label for="aggregate-tool-stream">工具调用流式兼容模式</label>
+            <p>关闭时实时返回；开启时等整轮完成后集中返回，可能使客户端 TPS 偏高。</p>
+          </div>
+          <label class="switch">
+            <input id="aggregate-tool-stream" v-model="config.AggregateToolStream" type="checkbox" />
+            <span></span>
+          </label>
+        </div>
+        <div class="hint-box compact-hint">
+          <span>不会缓存失败或限制新请求频率。模型回退按“服务监听”中的开关及顺序执行。</span>
         </div>
       </div>
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,17 @@ func TestExtractUsageFromJSONUsageWrapper(t *testing.T) {
 	input, output := extractUsageFromJSON(`{"usage":{"prompt_tokens":161,"completion_tokens":3,"total_tokens":164}}`)
 	if input != 161 || output != 3 {
 		t.Fatalf("extractUsageFromJSON usage wrapper = (%d, %d), want (161, 3)", input, output)
+	}
+}
+
+func TestVerifyUsageAliasesDoNotDoubleCount(t *testing.T) {
+	input, output := extractUsageFromJSON(`{"usage":{"input_tokens":100,"prompt_tokens":100,"output_tokens":20,"completion_tokens":20}}`)
+	if input != 100 || output != 20 {
+		t.Fatalf("aliases doubled counts: %d/%d", input, output)
+	}
+	input, output = extractUsageFromJSON(`{"usage":{"input_tokens":0,"prompt_tokens":100,"output_tokens":0,"completion_tokens":20}}`)
+	if input != 0 || output != 0 {
+		t.Fatalf("explicit zero lost: %d/%d", input, output)
 	}
 }
 
@@ -112,5 +124,27 @@ func TestGetLogDetailUsesIDForSameSecondLogs(t *testing.T) {
 	}
 	if got.Message != "first full message" {
 		t.Fatalf("GetLogDetail returned wrong same-second log: %#v", got)
+	}
+}
+
+func TestVerifyModelCachePreservesCapabilityChanges(t *testing.T) {
+	var models []ModelInfo
+	if err := json.Unmarshal([]byte(`[{"id":"future","name":"Future","context_window":200000,"max_context_length":1000000,"context_options":[200000,400000,1000000],"supports_vision":true,"input_modalities":["text","image"]}]`), &models); err != nil {
+		t.Fatal(err)
+	}
+	m := models[0]
+	if m.MaxContextLength != 1000000 || m.SupportsVision == nil || !*m.SupportsVision || len(m.ContextOptions) != 3 {
+		t.Fatalf("cache lost metadata: %+v", m)
+	}
+	previous := append([]ModelInfo(nil), models...)
+	previous[0].MaxContextLength = 200000
+	if sameModelList(previous, models) {
+		t.Fatal("context change ignored")
+	}
+	previous = append([]ModelInfo(nil), models...)
+	no := false
+	previous[0].SupportsVision = &no
+	if sameModelList(previous, models) {
+		t.Fatal("vision change ignored")
 	}
 }

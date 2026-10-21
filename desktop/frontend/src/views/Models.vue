@@ -18,60 +18,14 @@ const filtered = computed(() => {
 })
 
 function modelSpec(model) {
-  const text = `${model.id} ${model.name}`.toLowerCase()
-  if (text.includes('kmodel') || text.includes('kimi')) {
-    return {
-      context: '256k',
-      capability: '文本/图像/视频/工具',
-      source: 'Kimi 官方',
-    }
-  }
-  if (text.includes('mmodel') || text.includes('minimax')) {
-    return {
-      context: '200k',
-      capability: 'Agent / Tool Use',
-      source: 'MiniMax 官方',
-    }
-  }
-  if (text.includes('coder')) {
-    return {
-      context: '256k',
-      capability: 'Agentic Coding / Function Calling',
-      source: 'Qwen 官方 / 阿里云百炼',
-    }
-  }
-  if (text.includes('thinking')) {
-    return {
-      context: '1M',
-      capability: '思考 / Function Calling / 推理',
-      source: '阿里云百炼 Qwen3',
-    }
-  }
-  if (text.includes('qwen_max') || text.includes('qwen3-max')) {
-    return {
-      context: '256k',
-      capability: 'Agent / Tool Invocation',
-      source: '阿里云百炼 Qwen3-Max',
-    }
-  }
-  if (text.includes('qmodel') || text.includes('qwen3.6')) {
-    return {
-      context: '1M',
-      capability: '通用 / 多模态 / 代码增强',
-      source: '阿里云百炼 Qwen3.6-Plus',
-    }
-  }
-  if (text.includes('auto')) {
-    return {
-      context: '自动',
-      capability: 'Lingma / QoderCN 自动路由',
-      source: '账号返回',
-    }
-  }
+  const format = (value) => value >= 1000000 ? `${value / 1000000}M` : `${value / 1000}K`
+  const maximum = model.max_context_length || model.context_window
+  const modalities = model.input_modalities || []
+  const vision = model.supports_vision ?? (modalities.length ? modalities.includes('image') : null)
   return {
-    context: '未公开',
-    capability: '通用',
-    source: '账号返回',
+    context: maximum ? `最大 ${format(maximum)}` : '上下文未公开',
+    capability: vision === null ? '图像能力未公开' : (vision ? '文本 / 图像' : '文本'),
+    source: model.context_window ? `默认 ${format(model.context_window)}` : '账号返回',
   }
 }
 
