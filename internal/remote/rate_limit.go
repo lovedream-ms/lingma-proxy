@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"lingma-ipc-proxy/internal/observe"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -131,15 +132,25 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 		if request.OnReasoning != nil {
 			current.OnReasoning = func(s string) {
 				if s != "" {
+					observe.Emit(ctx, "generating", "", 0)
+				}
+				if s != "" {
 					emitted = true
 				}
 				request.OnReasoning(s)
 			}
 		}
 		if request.OnToolDelta != nil {
-			current.OnToolDelta = func(call ToolCallFragment) { emitted = true; request.OnToolDelta(call) }
+			current.OnToolDelta = func(call ToolCallFragment) {
+				observe.Emit(ctx, "generating", "", 0)
+				emitted = true
+				request.OnToolDelta(call)
+			}
 		}
 		result, err := c.chatAttempt(ctx, current, func(s string) {
+			if s != "" {
+				observe.Emit(ctx, "generating", "", 0)
+			}
 			if s != "" {
 				emitted = true
 			}
@@ -169,6 +180,7 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 		if emitted || attempt >= maxRetries {
 			return nil, err
 		}
+		observe.Emit(ctx, "retry_wait", request.Model, delay)
 		if err := waitForContext(ctx, delay); err != nil {
 			return nil, err
 		}

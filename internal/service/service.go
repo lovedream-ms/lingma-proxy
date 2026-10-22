@@ -16,6 +16,7 @@ import (
 
 	"lingma-ipc-proxy/internal/lingmaipc"
 	"lingma-ipc-proxy/internal/modelmeta"
+	"lingma-ipc-proxy/internal/observe"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/toolemulation"
 	"lingma-ipc-proxy/internal/utils"
@@ -399,8 +400,14 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 func (s *Service) Generate(ctx context.Context, req ChatRequest) (result *ChatResult, err error) {
+	observe.Requested(ctx, req.Model)
+	observe.Emit(ctx, "upstream", req.Model, 0)
 	started := time.Now()
 	defer func() {
+		if err != nil {
+			d := DiagnoseError(err)
+			observe.Fail(ctx, d.Code, d.Message, d.Action)
+		}
 		if result != nil {
 			result.StartTime = started
 			result.EndTime = time.Now()
@@ -412,6 +419,8 @@ func (s *Service) Generate(ctx context.Context, req ChatRequest) (result *ChatRe
 }
 
 func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan StreamEvent, <-chan StreamResult, error) {
+	observe.Requested(ctx, req.Model)
+	observe.Emit(ctx, "upstream", req.Model, 0)
 	events := make(chan StreamEvent, 256)
 	done := make(chan StreamResult, 1)
 
@@ -420,6 +429,9 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 		var firstToken time.Time
 		streamedTokenEvents := 0
 		result, err := s.generateGuarded(ctx, req, func(event StreamEvent) {
+			if event.Delta != "" || event.ToolDelta != nil || event.Type == StreamEventActivity {
+				observe.Emit(ctx, "generating", "", 0)
+			}
 			if event.Type == StreamEventActivity {
 				streamedTokenEvents++
 				if firstToken.IsZero() {
@@ -440,6 +452,10 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 			}
 		})
 
+		if err != nil {
+			d := DiagnoseError(err)
+			observe.Fail(ctx, d.Code, d.Message, d.Action)
+		}
 		if result != nil {
 			result.StreamedTokenEvents = streamedTokenEvents
 			result.StartTime = started
@@ -523,6 +539,11 @@ func (s *Service) generateRemoteInternal(
 	client := s.remoteClientLocked()
 	var lastErr error
 	for i, model := range models {
+		stage := "upstream"
+		if i > 0 {
+			stage = "fallback"
+		}
+		observe.Emit(ctx, stage, model, 0)
 		attemptCtx, cancel := contextWithOptionalTimeout(ctx, s.cfg.Timeout)
 		result, emitted, err := s.generateRemoteWithModel(attemptCtx, client, req, prompt, model, onDelta, emulateTools)
 		cancel()

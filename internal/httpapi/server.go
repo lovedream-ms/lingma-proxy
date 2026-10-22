@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"lingma-ipc-proxy/internal/observe"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 	"lingma-ipc-proxy/internal/toolemulation"
@@ -29,6 +31,10 @@ import (
 )
 
 type Server struct {
+	activeMu sync.Mutex
+	active   map[string]*observe.Trace
+	OnRecord func(DebugRequestRecord)
+
 	svc     *service.Service
 	http    *http.Server
 	sem     chan struct{}
@@ -130,7 +136,12 @@ type modelResponse struct {
 	InputModalities  []string        `json:"input_modalities"`
 }
 
-type debugRequestRecord struct {
+type DebugRequestRecord struct {
+	Trace        observe.Snapshot   `json:"trace"`
+	Diagnosis    service.Diagnostic `json:"diagnosis"`
+	InputTokens  int                `json:"inputTokens"`
+	OutputTokens int                `json:"outputTokens"`
+
 	Time       string `json:"time"`
 	Method     string `json:"method"`
 	Path       string `json:"path"`
@@ -139,6 +150,8 @@ type debugRequestRecord struct {
 	Request    string `json:"request,omitempty"`
 	Response   string `json:"response,omitempty"`
 }
+
+type debugRequestRecord = DebugRequestRecord
 
 type debugLogRecord struct {
 	Time    string `json:"time"`
@@ -159,12 +172,15 @@ type DebugAppLogRecord struct {
 
 func NewServer(addr string, svc *service.Service) *Server {
 	s := &Server{
-		svc: svc,
-		sem: make(chan struct{}, svc.MaxConcurrentRequests()),
+		svc:    svc,
+		active: make(map[string]*observe.Trace),
+		sem:    make(chan struct{}, svc.MaxConcurrentRequests()),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/health", s.handleRoot)
+	mux.HandleFunc("/debug/activity", s.handleActivity)
+	mux.HandleFunc("/debug/diagnostics", s.handleDiagnostics)
 	mux.HandleFunc("/debug/requests", s.handleDebugRequests)
 	mux.HandleFunc("/debug/access-logs", s.handleDebugLogs)
 	mux.HandleFunc("/debug/app-logs", s.handleDebugAppLogs)
@@ -2936,6 +2952,13 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		}
 
 		start := time.Now()
+		ctx, trace := observe.New(r.Context(), uuid.NewString(), r.URL.Path)
+		r = r.WithContext(ctx)
+		w.Header().Set("X-Request-ID", trace.Snapshot().ID)
+		s.activeMu.Lock()
+		s.active[trace.Snapshot().ID] = trace
+		s.activeMu.Unlock()
+		defer func() { s.activeMu.Lock(); delete(s.active, trace.Snapshot().ID); s.activeMu.Unlock() }()
 
 		// Read request body for recording, then restore for downstream handler
 		var reqBody string
@@ -2951,7 +2974,31 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 
 		respBody := sanitizeRecordedBody(rw.body)
 
-		s.recordRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)
+		observe.Emit(r.Context(), "completed", "", 0)
+		diagnosis := service.Diagnostic{Code: "ok", Status: "ok", Message: "请求完成"}
+		if rw.statusCode >= 400 {
+			diagnosis = service.DiagnoseError(fmt.Errorf("request failed"))
+			diagnosis.Message = "请求失败，请查看响应详情"
+		}
+		if failure := trace.Snapshot(); failure.ErrorCode != "" {
+			diagnosis = service.Diagnostic{Code: failure.ErrorCode, Status: "error", Message: failure.ErrorMessage, Action: failure.Action}
+		}
+		record := DebugRequestRecord{Time: time.Now().Format(time.RFC3339), Method: r.Method, Path: r.URL.Path, StatusCode: rw.statusCode, DurationMS: duration.Milliseconds(), Request: reqBody, Response: respBody, Trace: trace.Snapshot(), Diagnosis: diagnosis}
+		s.recMu.Lock()
+		s.records = append(s.records, record)
+		if len(s.records) > 200 {
+			s.records = s.records[len(s.records)-200:]
+		}
+		s.recMu.Unlock()
+		if s.OnRecord != nil {
+			s.OnRecord(record)
+		}
+		s.recMu.Lock()
+		s.logs = append(s.logs, debugLogRecord{Time: record.Time, Level: debugLogLevel(record.StatusCode), Message: fmt.Sprintf("%s %s -> %d (%dms)", record.Method, record.Path, record.StatusCode, record.DurationMS)})
+		if len(s.logs) > 200 {
+			s.logs = s.logs[len(s.logs)-200:]
+		}
+		s.recMu.Unlock()
 		if s.OnRequest != nil {
 			go s.OnRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)
 		}
@@ -2960,7 +3007,7 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 
 func isDebugInspectionPath(path string) bool {
 	switch path {
-	case "/debug/requests", "/debug/logs", "/api/requests", "/api/logs", "/debug/access-logs", "/api/access-logs", "/debug/app-logs", "/api/app-logs":
+	case "/debug/activity", "/debug/diagnostics", "/debug/requests", "/debug/logs", "/api/requests", "/api/logs", "/debug/access-logs", "/api/access-logs", "/debug/app-logs", "/api/app-logs":
 		return true
 	default:
 		return false
@@ -3125,8 +3172,10 @@ func withCORS(next http.Handler) http.Handler {
 }
 
 func (s *Server) acquire(ctx context.Context) bool {
+	observe.Emit(ctx, "queued", "", 0)
 	select {
 	case s.sem <- struct{}{}:
+		observe.Emit(ctx, "upstream", "", 0)
 		return true
 	case <-ctx.Done():
 		return false

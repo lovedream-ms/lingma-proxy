@@ -33,6 +33,7 @@ const responseViewerRef = ref(null)
 const clearConfirmOpen = ref(false)
 let refreshTimer = null
 
+function stageLabel(value) { return ({received:'已接收',queued:'排队',upstream:'等待上游',generating:'收到上游内容',retry_wait:'退避重试',fallback:'切换模型',completed:'结束'})[value] || value }
 function requestKey(request) {
   return request?.id || request?.createdAt || request?.time || ''
 }
@@ -317,6 +318,14 @@ onUnmounted(() => {
       <div v-if="selectedKey" class="detail-panel hidden-scrollbar">
         <div v-if="detailLoading" class="empty-state">加载完整请求详情中...</div>
         <template v-else>
+          <div class="detail-section" v-if="selectedDetail?.trace?.id">
+            <h3>请求过程</h3>
+            <p>请求 ID：{{ selectedDetail.trace.id }}</p>
+            <p>请求模型：{{ selectedDetail.trace.requestedModel || '默认' }} · 实际模型：{{ selectedDetail.trace.actualModel || '未返回' }}</p>
+            <p>排队 {{ selectedDetail.trace.queueMs }} ms · 首个上游内容 {{ selectedDetail.trace.firstActivityMs ?? '未收到' }} ms</p>
+            <p>{{ selectedDetail.diagnosis?.message }} {{ selectedDetail.diagnosis?.action }}</p>
+            <div v-for="(event, i) in selectedDetail.trace.events" :key="i">{{ event.elapsedMs }} ms · {{ stageLabel(event.stage) }} {{ event.model }} <span v-if="event.waitMs">（等待 {{ event.waitMs }} ms）</span></div>
+          </div>
           <div class="detail-section">
             <div class="detail-toolbar">
               <h3>请求内容</h3>

@@ -105,3 +105,6 @@ export function StopProxy() {
 export function UpdateConfig(arg1) {
   return window['go']['main']['App']['UpdateConfig'](arg1);
 }
+
+export function RunDiagnostics(generate) { return window.go.main.App.RunDiagnostics(generate); }
+export function GetActivity() { return window.go.main.App.GetActivity(); }

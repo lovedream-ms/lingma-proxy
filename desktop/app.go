@@ -24,6 +24,7 @@ import (
 	"lingma-ipc-proxy/internal/deploy"
 	"lingma-ipc-proxy/internal/httpapi"
 	"lingma-ipc-proxy/internal/lingmaipc"
+	"lingma-ipc-proxy/internal/observe"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 
@@ -70,6 +71,9 @@ func resolveDesktopAppVersion() string {
 // App struct
 // RequestRecord stores a single HTTP request summary
 type RequestRecord struct {
+	Trace     observe.Snapshot   `json:"trace"`
+	Diagnosis service.Diagnostic `json:"diagnosis"`
+
 	ID           string `json:"id,omitempty"`
 	CreatedAt    string `json:"createdAt,omitempty"`
 	Time         string `json:"time"`
@@ -593,10 +597,12 @@ func (a *App) StartProxy() error {
 	svc := service.New(cfg)
 	server := httpapi.NewServer(addr, svc)
 	server.AppLogs = a.debugAppLogs
-	server.OnRequest = func(method, path string, statusCode int, duration time.Duration, reqBody, respBody string) {
+	server.OnRecord = func(item httpapi.DebugRequestRecord) {
+		method, path, statusCode, duration, reqBody, respBody := item.Method, item.Path, item.StatusCode, time.Duration(item.DurationMS)*time.Millisecond, item.Request, item.Response
 		inputTokens, outputTokens := extractTokenUsage(respBody)
 		model := extractRequestModel(reqBody)
 		record := RequestRecord{
+			Trace: item.Trace, Diagnosis: item.Diagnosis,
 			ID:           uuid.NewString(),
 			CreatedAt:    time.Now().Format(time.RFC3339),
 			Time:         time.Now().Format("15:04:05"),

@@ -5,6 +5,7 @@ import Logs from './views/Logs.vue'
 import Models from './views/Models.vue'
 import Requests from './views/Requests.vue'
 import Settings from './views/Settings.vue'
+import Diagnostics from './views/Diagnostics.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import { ClipboardSetText } from '../wailsjs/runtime'
 import { ChooseFeedbackExportPath, ClearLogs, ExportFeedbackBundle, ForceQuitApp, GetAppVersion, GetLogSummaries, GetRequestSummaries, GetStatus, HideWindow, MinimizeWindow, OpenPathInFileManager } from '../wailsjs/go/main/App.js'
@@ -59,6 +60,7 @@ const navigation = [
   { key: 'requests', label: '请求流', icon: 'bi-file-earmark-text' },
   { key: 'models', label: '模型', icon: 'bi-box' },
   { key: 'settings', label: '设置', icon: 'bi-gear' },
+ { key: 'diagnostics', label: '诊断', icon: 'bi-heart-pulse' },
   { key: 'logs', label: '日志', icon: 'bi-terminal' },
 ]
 
@@ -444,7 +446,8 @@ onUnmounted(() => {
         </KeepAlive>
         <Models v-if="currentTab === 'models'" @log="addLog" @status="setStatus" @notice="handleNotice" />
         <Settings v-else-if="currentTab === 'settings'" @log="addLog" @status-refresh="refreshStatus" />
-        <Logs v-else-if="currentTab === 'logs'" :logs="logs" @clear="clearLocalLogs" @notice="handleNotice" />
+        <Diagnostics v-else-if="currentTab === 'diagnostics'" />
+ <Logs v-else-if="currentTab === 'logs'" :logs="logs" @clear="clearLocalLogs" @notice="handleNotice" />
       </main>
     </section>
     <div v-if="toast" class="toast">{{ toast }}</div>
