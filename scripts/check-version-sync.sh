@@ -7,7 +7,6 @@ TARGETS=(
   "desktop/wails.json"
   "internal/version/version.go"
   "README.md"
-  "README.zh-CN.md"
   "CHANGELOG.md"
 )
 

@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased (target: v1.6.14)
+## Unreleased (target: v1.6.16)
+
+## v1.6.16 - 2026-10-21
+
+- Preserve inline/quoted tool syntax, ordinary JSON and nested documentation fences instead of rejecting or truncating normal assistant explanations. Share Markdown action boundaries between parsing, validation and streaming while retaining invalid-action rejection and bounded tool repair.
+- Restore the two Ubuntu build helpers required by the unified release entry point and remove deleted translated-README references from version synchronization.
+- 修复介绍工具协议时误报 unrecognized tool action / PI_AI_ERROR 及流式正文截断；保留正常工具调用、非法调用拦截与循环保护，并恢复完整双平台构建。
+
+## v1.6.15 - 2026-10-21
+
+- Repository cleanup release (existing v1.6.15 tag); canonical source version was still 1.6.14.
 
 ## v1.6.14 - 2026-10-21
 

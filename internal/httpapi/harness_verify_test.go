@@ -131,3 +131,110 @@ func TestVerifyHarnessPlainJSONAndUsageOptOut(t *testing.T) {
 		t.Fatalf("ordinary JSON or usage opt-out broken: %s", body)
 	}
 }
+
+func TestVerifyHarnessDocumentationAcrossProtocols(t *testing.T) {
+	text := strings.Repeat("项目功能：支持协议转换与工具调用。", 20) + "\nAction Block 解析 (` ```json action`)。\n字段 `{\"tool\"` 与 `{\"name\"` 是说明。\n```json\n{\"name\":\"Alice\"}\n```\n````markdown\n```json action\n{\"tool\":\"read\",\"parameters\":{}}\n```\n````\n完整总结结束。"
+	for _, aggregate := range []string{"false", "true"} {
+		for _, stream := range []bool{false, true} {
+			for _, path := range []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"} {
+				t.Run(fmt.Sprintf("%s/aggregate=%s/stream=%v", path, aggregate, stream), func(t *testing.T) {
+					t.Setenv("LINGMA_AGGREGATE_TOOL_STREAM", aggregate)
+					s, count := verifyHarnessServer(t, func(int, map[string]any) []map[string]any {
+						var frames []map[string]any
+						for _, r := range text {
+							frames = append(frames, verifyDelta(map[string]any{"content": string(r)}))
+						}
+						return append(frames, map[string]any{"choices": []any{}, "usage": map[string]any{"prompt_tokens": 100, "completion_tokens": 200}})
+					})
+					request := map[string]any{"model": "kmodel", "stream": stream, "messages": []any{map[string]any{"role": "user", "content": "总结项目功能"}}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "read", "parameters": map[string]any{"type": "object"}}}}}
+					if path == "/v1/messages" {
+						request["max_tokens"] = 2000
+						request["tools"] = []any{map[string]any{"name": "read", "input_schema": map[string]any{"type": "object"}}}
+					} else if path == "/v1/responses" {
+						delete(request, "messages")
+						request["input"] = "总结项目功能"
+						request["tools"] = []any{map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}}}
+					}
+					raw, _ := json.Marshal(request)
+					rec := httptest.NewRecorder()
+					s.http.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(raw))))
+					body := rec.Body.String()
+					if rec.Code != http.StatusOK || count.Load() != 1 || strings.Contains(body, "unrecognized tool action") || strings.Contains(body, `"error":{`) {
+						t.Fatalf("documentation rejected or retried: status=%d count=%d body=%s", rec.Code, count.Load(), body)
+					}
+					var got strings.Builder
+					if stream {
+						for _, line := range strings.Split(body, "\n") {
+							if !strings.HasPrefix(line, "data: {") {
+								continue
+							}
+							var frame struct {
+								Type    string          `json:"type"`
+								Text    string          `json:"text"`
+								Delta   json.RawMessage `json:"delta"`
+								Choices []struct {
+									Delta struct {
+										Content string `json:"content"`
+									} `json:"delta"`
+								} `json:"choices"`
+							}
+							if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame); err != nil {
+								t.Fatal(err)
+							}
+							if path == "/v1/chat/completions" {
+								for _, c := range frame.Choices {
+									got.WriteString(c.Delta.Content)
+								}
+							} else if frame.Type == "response.output_text.delta" {
+								var delta string
+								_ = json.Unmarshal(frame.Delta, &delta)
+								got.WriteString(delta)
+							} else if frame.Type == "response.output_text.done" && got.Len() == 0 {
+								got.WriteString(frame.Text)
+							} else if frame.Type == "content_block_delta" {
+								var delta struct {
+									Text string `json:"text"`
+								}
+								_ = json.Unmarshal(frame.Delta, &delta)
+								got.WriteString(delta.Text)
+							}
+						}
+					} else {
+						var response struct {
+							Choices []struct {
+								Message struct {
+									Content string `json:"content"`
+								} `json:"message"`
+							} `json:"choices"`
+							Content []struct {
+								Text string `json:"text"`
+							} `json:"content"`
+							Output []struct {
+								Content []struct {
+									Text string `json:"text"`
+								} `json:"content"`
+							} `json:"output"`
+						}
+						if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+							t.Fatal(err)
+						}
+						for _, c := range response.Choices {
+							got.WriteString(c.Message.Content)
+						}
+						for _, c := range response.Content {
+							got.WriteString(c.Text)
+						}
+						for _, o := range response.Output {
+							for _, c := range o.Content {
+								got.WriteString(c.Text)
+							}
+						}
+					}
+					if got.String() != text {
+						t.Fatalf("text lost or changed: got %q want %q", got.String(), text)
+					}
+				})
+			}
+		}
+	}
+}

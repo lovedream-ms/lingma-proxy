@@ -797,30 +797,128 @@ func containsString(values []string, value string) bool {
 	return false
 }
 
-func findActionOpenings(text string) []int {
-	out := make([]int, 0)
-	searches := []string{"```json action", "```action", "``` action", "```json\n", "```json\r\n"}
-	for idx := 0; idx < len(text); {
-		foundAt := -1
-		foundLen := 0
-		for _, needle := range searches {
-			i := strings.Index(text[idx:], needle)
-			if i < 0 {
-				continue
-			}
-			pos := idx + i
-			if foundAt < 0 || pos < foundAt {
-				foundAt = pos
-				foundLen = len(needle)
-			}
+// ActionTextState keeps Markdown context across streamed text fragments.
+// Only standalone fences are executable; inline and quoted examples stay text.
+type ActionTextState struct {
+	linePrefix string
+	fence      byte
+	width      int
+	started    bool
+}
+
+func markdownFence(line string) (byte, int, string) {
+	line = strings.TrimRight(line, "\r\n")
+	trimmed := strings.TrimLeft(line, " ")
+	if len(line)-len(trimmed) > 3 || len(trimmed) < 3 || (trimmed[0] != '`' && trimmed[0] != '~') {
+		return 0, 0, ""
+	}
+	mark := trimmed[0]
+	n := 0
+	for n < len(trimmed) && trimmed[n] == mark {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, ""
+	}
+	return mark, n, strings.ToLower(strings.TrimSpace(trimmed[n:]))
+}
+
+func (s *ActionTextState) fenceLine(line string) bool {
+	mark, width, info := markdownFence(line)
+	if mark == 0 {
+		return false
+	}
+	if s.width > 0 {
+		if mark == s.fence && width >= s.width && info == "" {
+			s.fence, s.width = 0, 0
 		}
-		if foundAt < 0 {
+		return false
+	}
+	s.fence, s.width = mark, width
+	return mark == '`' && width == 3 && (info == "json action" || info == "action" || info == "json")
+}
+
+// StartIndex finds a potential action without consuming any text. A generic JSON
+// block/object is buffered until validation decides whether it is ordinary text.
+func (s ActionTextState) StartIndex(text string) int {
+	if !s.started && strings.HasPrefix(strings.TrimSpace(s.linePrefix+text), "{") {
+		return len(text) - len(strings.TrimLeft(text, " \t\r\n"))
+	}
+	prefixLen := len(s.linePrefix)
+	for _, line := range strings.Split(s.linePrefix+text, "\n") {
+		if s.fenceLine(line) {
+			return max(0, -prefixLen)
+		}
+		prefixLen -= len(line) + 1
+	}
+	return -1
+}
+
+// Consume records only text already released to the client.
+func (s *ActionTextState) Consume(text string) {
+	s.started = s.started || strings.TrimSpace(text) != ""
+	text = s.linePrefix + text
+	for {
+		i := strings.IndexByte(text, '\n')
+		if i < 0 {
 			break
 		}
-		out = append(out, foundAt)
-		idx = foundAt + foundLen
+		s.fenceLine(text[:i])
+		text = text[i+1:]
+	}
+	s.linePrefix = text
+}
+
+func findActionOpenings(text string) []int {
+	var state ActionTextState
+	var out []int
+	pos := 0
+	for _, line := range strings.Split(text, "\n") {
+		if state.fenceLine(line) {
+			out = append(out, pos+len(line)-len(strings.TrimLeft(line, " ")))
+		}
+		pos += len(line) + 1
 	}
 	return out
+}
+
+func hasToolEnvelope(text string) bool {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(normalizeJSON(strings.TrimSpace(text))), &obj) != nil {
+		return false
+	}
+	if fn, ok := obj["function"]; ok {
+		return hasToolEnvelope(string(fn))
+	}
+	if _, ok := obj["tool"]; ok {
+		return true
+	}
+	if _, ok := obj["name"]; ok {
+		for _, key := range []string{"arguments", "parameters", "input"} {
+			if _, ok := obj[key]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// LooksLikeToolSyntax distinguishes action envelopes from prose about tools.
+func LooksLikeToolSyntax(text string) bool {
+	if hasToolEnvelope(text) {
+		return true
+	}
+	for _, start := range findActionOpenings(text) {
+		line, raw, _ := strings.Cut(text[start:], "\n")
+		_, _, info := markdownFence(line)
+		if info == "action" || info == "json action" {
+			return true
+		}
+		if end := findClosingFence(raw, 0); end >= 0 && hasToolEnvelope(raw[:end]) {
+			return true
+		}
+	}
+	return false
 }
 
 func findClosingFence(text string, from int) int {

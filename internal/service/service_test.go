@@ -417,3 +417,36 @@ func TestBuildLingmaPromptInjectsToolingForImageContextRemoteFallback(t *testing
 		t.Fatalf("image-context remote fallback prompt should include tool emulation, got %q", prompt)
 	}
 }
+
+func TestToolSyntaxDocumentationIsNotAnAction(t *testing.T) {
+	for _, text := range []string{
+		"Action Block 解析 (` ```json action`)，这是格式说明。",
+		"错误检测包含 `{\"tool\"` 和 `{\"name\"`。后续说明必须保留。",
+		"JSON 示例：\n```json\n{\"name\":\"Alice\",\"description\":\"tool parameters\"}\n```\n结束。",
+		"{\"name\":\"Alice\"}",
+		"外层文档：\n````markdown\n```json action\n{\"tool\":\"read\",\"parameters\":{}}\n```\n````\n结束。",
+		"> ```json action\n> {\"tool\":\"read\",\"parameters\":{}}\n> ```",
+	} {
+		t.Run(text, func(t *testing.T) {
+			result := &remote.ChatResult{Text: text}
+			err := normalizeRemoteToolResult(ChatRequest{Tools: []toolemulation.ToolDef{{Name: "read"}}, ToolChoice: toolemulation.ToolChoice{Mode: "auto"}}, result)
+			if err != nil || len(result.ToolCalls) != 0 || result.Text != text {
+				t.Fatalf("documentation changed: error=%v calls=%v text=%q", err, result.ToolCalls, result.Text)
+			}
+		})
+	}
+}
+
+func TestToolSyntaxStillRejectsInvalidActions(t *testing.T) {
+	for _, text := range []string{
+		"```json action\n{bad json}\n```",
+		"```action\n{\"tool\":\"unknown\",\"parameters\":{}}\n```",
+		"```json\n{\"tool\":\"unknown\",\"parameters\":{}}\n```",
+		"{\"tool\":\"unknown\",\"parameters\":{}}",
+	} {
+		result := &remote.ChatResult{Text: text}
+		if err := normalizeRemoteToolResult(ChatRequest{Tools: []toolemulation.ToolDef{{Name: "read"}}}, result); err == nil {
+			t.Fatalf("invalid action accepted: %s", text)
+		}
+	}
+}

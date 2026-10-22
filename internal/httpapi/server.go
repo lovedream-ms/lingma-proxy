@@ -1739,6 +1739,7 @@ type toolStreamFilter struct {
 	enabled bool
 	buffer  string
 	blocked bool
+	context toolemulation.ActionTextState
 }
 
 func newToolStreamFilter(enabled bool) *toolStreamFilter {
@@ -1756,7 +1757,7 @@ func (f *toolStreamFilter) Push(delta string) []string {
 	if f.blocked {
 		return nil
 	}
-	if idx := actionBlockStartIndex(f.buffer); idx >= 0 {
+	if idx := f.context.StartIndex(f.buffer); idx >= 0 {
 		safe := f.buffer[:idx]
 		f.buffer = f.buffer[idx:]
 		f.blocked = true
@@ -1765,14 +1766,11 @@ func (f *toolStreamFilter) Push(delta string) []string {
 		}
 		return []string{safe}
 	}
-	if looksLikeActionPrefix(f.buffer) {
-		return nil
-	}
 	return f.flushSafeTail(actionMarkerTailRunes)
 }
 
 func (f *toolStreamFilter) Flush() []string {
-	if f.buffer == "" || f.blocked {
+	if f.buffer == "" || (f.blocked && toolemulation.LooksLikeToolSyntax(f.buffer)) {
 		return nil
 	}
 	out := f.buffer
@@ -1786,47 +1784,12 @@ func (f *toolStreamFilter) flushSafeTail(tailRunes int) []string {
 		return nil
 	}
 	safe := string(runes[:len(runes)-tailRunes])
+	f.context.Consume(safe)
 	f.buffer = string(runes[len(runes)-tailRunes:])
 	if safe == "" {
 		return nil
 	}
 	return []string{safe}
-}
-
-func actionBlockStartIndex(text string) int {
-	lower := strings.ToLower(text)
-	markers := []string{
-		"```json action",
-		"``` action",
-		"{\"tool\"",
-		"{\"name\"",
-	}
-	best := -1
-	for _, marker := range markers {
-		if idx := strings.Index(lower, marker); idx >= 0 && (best == -1 || idx < best) {
-			best = idx
-		}
-	}
-	return best
-}
-
-func looksLikeActionPrefix(text string) bool {
-	trimmed := strings.ToLower(strings.TrimLeft(text, " \t\r\n"))
-	if trimmed == "" {
-		return true
-	}
-	prefixes := []string{
-		"```json action",
-		"``` action",
-		"{\"tool\"",
-		"{\"name\"",
-	}
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(prefix, trimmed) || strings.HasPrefix(trimmed, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 func truthyEnv(name string) bool {

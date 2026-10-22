@@ -683,13 +683,7 @@ func (s *Service) generateRemoteWithModel(
 }
 
 func looksLikeToolSyntax(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	if strings.Contains(lower, "```json action") || strings.Contains(lower, "```action") || strings.Contains(lower, "``` action") {
-		return true
-	}
-	return (strings.HasPrefix(lower, "{") || strings.Contains(lower, "```json")) &&
-		(strings.Contains(lower, `"tool"`) || strings.Contains(lower, `"function"`) ||
-			(strings.Contains(lower, `"name"`) && (strings.Contains(lower, `"arguments"`) || strings.Contains(lower, `"parameters"`))))
+	return toolemulation.LooksLikeToolSyntax(text)
 }
 
 func normalizeRemoteToolResult(req ChatRequest, result *remote.ChatResult) error {

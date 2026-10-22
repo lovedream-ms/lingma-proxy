@@ -814,3 +814,52 @@ func TestSanitizeRecordedBodyRedactsImagePayloads(t *testing.T) {
 		t.Fatalf("missing redaction marker: %s", got)
 	}
 }
+
+func TestToolStreamFilterPreservesDocumentationAtEverySplit(t *testing.T) {
+	for _, text := range []string{
+		strings.Repeat("项目功能总结。", 40) + "Action Block 解析 (` ```json action`)\n后续说明。",
+		"字段 `{\"tool\"` 和 `{\"name\"` 都只是文本。",
+		"文档：\n```json\n{\"name\":\"Alice\"}\n```\n完整结尾。",
+		"文档：\n````markdown\n```json action\n{\"tool\":\"read\",\"parameters\":{}}\n```\n````\n完整结尾。",
+		"> ```json action\n> 引用\n> ```\n完整结尾。",
+		"{\"name\":\"Alice\"}",
+	} {
+		runes := []rune(text)
+		for split := 0; split <= len(runes); split++ {
+			filter := newToolStreamFilter(true)
+			chunks := filter.Push(string(runes[:split]))
+			chunks = append(chunks, filter.Push(string(runes[split:]))...)
+			chunks = append(chunks, filter.Flush()...)
+			if got := strings.Join(chunks, ""); got != text {
+				t.Fatalf("split=%d lost text: got %q want %q", split, got, text)
+			}
+		}
+		filter := newToolStreamFilter(true)
+		var chunks []string
+		for _, r := range runes {
+			chunks = append(chunks, filter.Push(string(r))...)
+		}
+		chunks = append(chunks, filter.Flush()...)
+		if got := strings.Join(chunks, ""); got != text {
+			t.Fatalf("single rune chunks lost text: %q", got)
+		}
+	}
+}
+
+func TestToolStreamFilterStillWithholdsRealActionsAtEverySplit(t *testing.T) {
+	for _, action := range []string{
+		"```json action\n{\"tool\":\"read\",\"parameters\":{}}\n```",
+		"```action\n{\"tool\":\"read\",\"parameters\":{}}\n```",
+		"```json\n{\"tool\":\"read\",\"parameters\":{}}\n```",
+		"{ \"function\": {\"name\":\"read\",\"arguments\":{}}}",
+	} {
+		for split := 0; split <= len(action); split++ {
+			filter := newToolStreamFilter(true)
+			out := append(filter.Push(action[:split]), filter.Push(action[split:])...)
+			out = append(out, filter.Flush()...)
+			if len(out) != 0 {
+				t.Fatalf("action leaked at split=%d: %v", split, out)
+			}
+		}
+	}
+}

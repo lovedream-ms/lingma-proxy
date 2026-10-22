@@ -248,6 +248,18 @@ func TestParseActionBlocksMapsReadAlias(t *testing.T) {
 	}
 }
 
+func TestParseActionBlocksPreservesTopLevelNameArguments(t *testing.T) {
+	for _, text := range []string{
+		`{"name":"read_file","path":"/tmp/a.txt"}`,
+		"```json\n{\"name\":\"read_file\",\"path\":\"/tmp/a.txt\"}\n```",
+	} {
+		calls, _, err := ParseActionBlocks(text, []ToolDef{{Name: "read_file"}}, Config{})
+		if err != nil || len(calls) != 1 || calls[0].Arguments["path"] != "/tmp/a.txt" {
+			t.Fatalf("legacy argument form lost: calls=%+v err=%v", calls, err)
+		}
+	}
+}
+
 func TestParseActionBlocksDropsCallsMissingRequiredArgs(t *testing.T) {
 	text := "```json action\n{\"tool\":\"Read\",\"parameters\":{\"path\":\"/tmp/a.txt\"}}\n```"
 	calls, clean, err := ParseActionBlocks(text, []ToolDef{{

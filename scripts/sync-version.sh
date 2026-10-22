@@ -75,13 +75,6 @@ replaceBetween(
   `Current desktop app version: \`v${version}\`.\n\nThe canonical source is [VERSION](./VERSION). Run \`./scripts/sync-version.sh\` to propagate it into [desktop/wails.json](./desktop/wails.json), the desktop UI, and release-facing docs.`
 );
 
-replaceBetween(
-  'README.zh-CN.md',
-  '<!-- VERSION:CURRENT:BEGIN -->',
-  '<!-- VERSION:CURRENT:END -->',
-  `当前桌面端版本：\`v${version}\`。\n\n唯一来源是 [VERSION](./VERSION)。执行 \`./scripts/sync-version.sh\` 会把它同步到 [desktop/wails.json](./desktop/wails.json)、桌面 UI 和面向发布的文档块。`
-);
-
 replaceRegex(
   'CHANGELOG.md',
   /^## Unreleased(?: \(target: v[^\n]+\))?$/m,
