@@ -13,6 +13,7 @@ const bundlePickPolicy = ref('auto')
 const bundleResult = ref(null)
 const openSelect = ref('')
 const fallbackModelsText = ref('')
+const aliasesText = ref('{}')
 const isIPCBackend = computed(() => (config.value.Backend || 'ipc') === 'ipc')
 const formattedTokenExpireAt = computed(() => formatDateTime(detection.value?.remoteTokenExpireAt))
 const remoteProxyStatus = computed(() => {
@@ -97,6 +98,7 @@ function formatDateTime(value) {
 onMounted(async () => {
   try {
     config.value = await GetConfig()
+ aliasesText.value=JSON.stringify(config.value.ModelAliases || {},null,2)
     models.value = await GetModels().catch(() => [])
     fallbackModelsText.value = Array.isArray(config.value.RemoteFallbackModels)
       ? config.value.RemoteFallbackModels.join('\n')
@@ -122,7 +124,8 @@ async function save() {
       .split(/\n|,/)
       .map((item) => item.trim())
       .filter(Boolean)
-    await UpdateConfig(config.value)
+    config.value.ModelAliases=JSON.parse(aliasesText.value)
+ await UpdateConfig(config.value)
     await refreshDetection()
     emit('log', 'info', '配置已保存，代理已按需重启')
     emit('status-refresh')
@@ -173,6 +176,7 @@ async function openBundleFolder() {
 
     <section class="glass-panel">
  <h2>访问与日志</h2>
+ <div class="field"><label>模型别名（JSON 对象，例如 {&quot;coding&quot;:&quot;kmodel&quot;}）</label><textarea v-model="aliasesText" /></div>
  <p>本机监听可留空密钥；局域网监听必须设置访问密钥。管理密钥只用于调试接口，未设置时调试仅限本机。</p>
  <div class="form-grid">
   <div class="field"><label>代理访问密钥</label><input v-model="config.APIKey" type="password" autocomplete="new-password" /><button class="secondary-button" type="button" @click="config.APIKey=randomKey()">生成随机密钥</button></div>

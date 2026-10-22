@@ -114,6 +114,8 @@ type TokenStats struct {
 
 // ModelInfo represents a model returned by /v1/models
 type ModelInfo struct {
+	AdapterCapabilities map[string]service.Capability `json:"adapter_capabilities"`
+
 	ContextWindow    int      `json:"context_window"`
 	MaxContextLength int      `json:"max_context_length"`
 	ContextOptions   []int    `json:"context_options,omitempty"`
@@ -135,6 +137,8 @@ type ProxyStatus struct {
 
 // App struct
 type App struct {
+	clientMu sync.Mutex
+
 	ctx             context.Context
 	cfg             service.Config
 	mu              sync.RWMutex
@@ -558,6 +562,7 @@ func (a *App) saveConfig(cfg service.Config) error {
 		"remote_retry_count":         cfg.RemoteRetryCount,
 		"remote_retry_base_delay_ms": cfg.RemoteRetryBaseDelayMS,
 		"aggregate_tool_stream":      cfg.AggregateToolStream,
+		"model_aliases":              cfg.ModelAliases,
 		"api_key":                    cfg.APIKey,
 		"admin_key":                  cfg.AdminKey,
 		"allowed_origins":            cfg.AllowedOrigins,
@@ -587,7 +592,7 @@ func (a *App) saveConfig(cfg service.Config) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0600)
+	return atomicClientWrite(path, data)
 }
 
 // StartProxy starts the lingma-ipc-proxy HTTP server
@@ -1192,6 +1197,10 @@ func (a *App) SelectModel(modelID string) (ProxyStatus, error) {
 }
 
 func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, error) {
+	host, port, splitErr := net.SplitHostPort(addr)
+	if splitErr == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+		addr = net.JoinHostPort("127.0.0.1", port)
+	}
 	url := fmt.Sprintf("http://%s/v1/models", addr)
 	if timeout <= 0 {
 		timeout = proxyWarmupTimeout
@@ -1464,7 +1473,7 @@ func appStatePath() (string, error) {
 
 func (a *App) accumulateTokenStatsLocked(record RequestRecord) {
 	a.stats.TotalRequests++
-	if record.StatusCode >= 200 && record.StatusCode < 300 {
+	if record.StatusCode >= 200 && record.StatusCode < 300 && record.Diagnosis.Status != "error" {
 		a.stats.SuccessRequests++
 	}
 	a.stats.InputTokens += record.InputTokens
@@ -1862,6 +1871,7 @@ func sanitizeRequests(requests []RequestRecord) []RequestRecord {
 	out := make([]RequestRecord, 0, len(requests))
 	for _, record := range requests {
 		out = append(out, RequestRecord{
+			Trace: record.Trace, Diagnosis: record.Diagnosis,
 			ID:           record.ID,
 			CreatedAt:    record.CreatedAt,
 			Time:         record.Time,

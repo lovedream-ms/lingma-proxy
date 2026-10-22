@@ -10,6 +10,8 @@ import (
 // RuntimeSettingsFile is shared by desktop and console config readers.
 // Pointers preserve explicit zero retries and false streaming overrides.
 type RuntimeSettingsFile struct {
+	ModelAliases map[string]string `json:"model_aliases"`
+
 	APIKey              string   `json:"api_key"`
 	AdminKey            string   `json:"admin_key"`
 	AllowedOrigins      []string `json:"allowed_origins"`
@@ -27,6 +29,8 @@ type RuntimeSettingsFile struct {
 }
 
 func (settings RuntimeSettingsFile) Apply(cfg *Config) {
+	cfg.ModelAliases = settings.ModelAliases
+
 	cfg.APIKey = settings.APIKey
 	cfg.AdminKey = settings.AdminKey
 	cfg.AllowedOrigins = settings.AllowedOrigins
@@ -99,6 +103,15 @@ func NormalizeRuntimeSettings(cfg Config) Config {
 }
 
 func (cfg Config) ValidateRuntimeSettings() error {
+	for alias, target := range cfg.ModelAliases {
+		if strings.TrimSpace(alias) == "" || strings.TrimSpace(target) == "" || alias == target {
+			return fmt.Errorf("模型别名和目标必须有效且不同")
+		}
+		if _, chained := cfg.ModelAliases[target]; chained {
+			return fmt.Errorf("模型别名不支持链式映射")
+		}
+	}
+
 	if cfg.LogMode != "metadata" && cfg.LogMode != "errors" && cfg.LogMode != "full" {
 		return fmt.Errorf("日志模式必须为 metadata / errors / full")
 	}

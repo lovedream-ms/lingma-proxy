@@ -120,6 +120,8 @@ type rawMessage struct {
 }
 
 type modelResponse struct {
+	AdapterCapabilities map[string]service.Capability `json:"adapter_capabilities"`
+
 	ContextCapacity  int             `json:"contextWindow"`
 	ContextOptions   []int           `json:"context_options,omitempty"`
 	Capabilities     map[string]bool `json:"capabilities"`
@@ -209,6 +211,7 @@ func NewServer(addr string, svc *service.Service) *Server {
 		Addr:              addr,
 		Handler:           s.withAccess(s.withRecorder(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
 	}
 	return s
 }
@@ -244,6 +247,9 @@ func (s *Server) applyDefaultModel(req *service.ChatRequest) {
 	req.AggregateToolStream = s.svc.AggregateToolStream()
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.svc.DefaultModel()
+	}
+	if target := s.svc.RuntimeConfig().ModelAliases[req.Model]; target != "" {
+		req.Model = target
 	}
 }
 
@@ -413,20 +419,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	for _, model := range models {
 		data = append(data, modelResponse{
-			ID:               model.ID,
-			Object:           "model",
-			Created:          created,
-			OwnedBy:          "lingma",
-			Name:             model.Name,
-			ContextWindow:    model.ContextWindow,
-			MaxContextLength: modelMaximumContext(model),
-			ContextCapacity:  modelMaximumContext(model),
-			ContextOptions:   model.ContextOptions,
-			Capabilities:     map[string]bool{"vision": model.SupportsVision},
-			MaxInputTokens:   model.MaxInputTokens,
-			SupportsText:     true,
-			SupportsVision:   model.SupportsVision,
-			InputModalities:  modelInputModalities(model),
+			AdapterCapabilities: s.svc.CapabilityProfile(),
+			ID:                  model.ID,
+			Object:              "model",
+			Created:             created,
+			OwnedBy:             "lingma",
+			Name:                model.Name,
+			ContextWindow:       model.ContextWindow,
+			MaxContextLength:    modelMaximumContext(model),
+			ContextCapacity:     modelMaximumContext(model),
+			ContextOptions:      model.ContextOptions,
+			Capabilities:        map[string]bool{"vision": model.SupportsVision},
+			MaxInputTokens:      model.MaxInputTokens,
+			SupportsText:        true,
+			SupportsVision:      model.SupportsVision,
+			InputModalities:     modelInputModalities(model),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -462,7 +469,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "lingma-proxy",
+		"adapter_capabilities": s.svc.CapabilityProfile(),
+		"service":              "lingma-proxy",
 		"protocols": []string{
 			"openai.chat_completions",
 			"openai.responses",
@@ -2986,7 +2994,7 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 		duration := time.Since(start)
 
-		respBody := sanitizeRecordedBody(rw.body)
+		respBody := limitRecorded(sanitizeRecordedBody(rw.body), s.svc.RuntimeConfig().LogBodyMaxBytes)
 
 		observe.Emit(r.Context(), "completed", "", 0)
 		diagnosis := service.Diagnostic{Code: "ok", Status: "ok", Message: "请求完成"}
@@ -3001,6 +3009,10 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		if cfg.LogMode == "metadata" || cfg.LogMode == "errors" && diagnosis.Status != "error" {
 			reqBody = ""
 			respBody = ""
+		}
+		if usage := trace.Snapshot(); usage.UsageKnown {
+			rw.usage.Input = usage.InputTokens
+			rw.usage.Output = usage.OutputTokens
 		}
 		record := DebugRequestRecord{InputTokens: rw.usage.Input, OutputTokens: rw.usage.Output, Time: time.Now().Format(time.RFC3339), Method: r.Method, Path: r.URL.Path, StatusCode: rw.statusCode, DurationMS: duration.Milliseconds(), Request: reqBody, Response: respBody, Trace: trace.Snapshot(), Diagnosis: diagnosis}
 		s.recMu.Lock()

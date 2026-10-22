@@ -896,6 +896,7 @@ button {
 :root[data-theme='dark'] .data-table th,
 :root[data-theme='dark'] .field input,
 :root[data-theme='dark'] .field textarea,
+:root[data-theme='dark'] .field select,
 :root[data-theme='dark'] .search-input,
 :root[data-theme='dark'] .detail-panel pre,
 :root[data-theme='dark'] .code-block {
@@ -1860,6 +1861,7 @@ button:disabled {
 
 .field input,
 .field textarea,
+.field select,
 .search-input {
   width: 100%;
   min-height: 34px;
@@ -1887,6 +1889,7 @@ button:disabled {
 
 .field input:focus,
 .field textarea:focus,
+.field select:focus,
 .search-input:focus {
   border-color: rgba(37, 99, 235, 0.56);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);

@@ -8,6 +8,7 @@ import (
 	"lingma-ipc-proxy/internal/service"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,5 +124,42 @@ func TestPersonalRequestLimitAndSecretRedaction(t *testing.T) {
 		if got := SanitizeLogBody(raw, 1024); strings.Contains(got, "secret") {
 			t.Fatalf("secret persisted: %s", got)
 		}
+	}
+}
+
+func TestDiagnosticsNeverGenerateOnGET(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			calls++
+			t.Error("diagnostic GET triggered generation")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"kmodel","name":"Kimi"}]}`))
+	}))
+	defer upstream.Close()
+	auth := filepath.Join(t.TempDir(), "auth.json")
+	if err := remote.SaveCredentialFile(remote.Credential{CosyKey: "test", EncryptUserInfo: "test", UserID: "test", MachineID: "test"}, auth); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("", service.New(service.Config{Backend: service.BackendRemote, Model: "kmodel", RemoteAuthFile: auth, RemoteBaseURL: upstream.URL}))
+	defer s.svc.Close()
+	req := httptest.NewRequest("GET", "/debug/diagnostics", nil)
+	req.RemoteAddr = "127.0.0.1:1"
+	rec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(rec, req)
+	if rec.Code != 200 || calls != 0 || !strings.Contains(rec.Body.String(), `"code":"catalog"`) {
+		t.Fatalf("unexpected diagnostic %s", rec.Body.String())
+	}
+}
+
+func TestPersonalUsageWithoutClientUsageChunk(t *testing.T) {
+	s, _ := verifyHarnessServer(t, func(int, map[string]any) []map[string]any {
+		return []map[string]any{verifyDelta(map[string]any{"content": "OK"}), {"choices": []any{}, "usage": map[string]any{"prompt_tokens": 12, "completion_tokens": 3}}}
+	})
+	body := verifyHarnessRequestBody(t, s, `{"model":"kmodel","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hello"}]}`)
+	records := s.debugRecords(1)
+	if strings.Contains(body, "prompt_tokens") || len(records) != 1 || records[0].InputTokens != 12 || records[0].OutputTokens != 3 {
+		t.Fatalf("usage opt-out broke internal accounting: %+v %s", records, body)
 	}
 }

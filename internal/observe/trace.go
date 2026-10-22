@@ -14,6 +14,9 @@ type Event struct {
 }
 
 type Snapshot struct {
+	InputTokens  int    `json:"inputTokens"`
+	OutputTokens int    `json:"outputTokens"`
+	UsageKnown   bool   `json:"usageKnown"`
 	ErrorCode    string `json:"errorCode,omitempty"`
 	ErrorMessage string `json:"errorMessage,omitempty"`
 	Action       string `json:"action,omitempty"`
@@ -30,9 +33,10 @@ type Snapshot struct {
 }
 
 type Trace struct {
-	mu    sync.Mutex
-	start time.Time
-	data  Snapshot
+	mu        sync.Mutex
+	start     time.Time
+	queueDone bool
+	data      Snapshot
 }
 type contextKey struct{}
 
@@ -53,7 +57,9 @@ func (t *Trace) Snapshot() Snapshot {
 func Requested(ctx context.Context, model string) {
 	if t, ok := ctx.Value(contextKey{}).(*Trace); ok {
 		t.mu.Lock()
-		t.data.RequestedModel = model
+		if t.data.RequestedModel == "" {
+			t.data.RequestedModel = model
+		}
 		t.mu.Unlock()
 	}
 }
@@ -72,8 +78,9 @@ func Emit(ctx context.Context, stage, model string, wait time.Duration) {
 	if stage == "generating" {
 		t.data.FirstActivityMS = &elapsed
 	}
-	if stage == "upstream" && t.data.QueueMS == 0 {
+	if stage == "upstream" && !t.queueDone {
 		t.data.QueueMS = elapsed
+		t.queueDone = true
 	}
 	if model != "" {
 		t.data.ActualModel = model
@@ -81,6 +88,16 @@ func Emit(ctx context.Context, stage, model string, wait time.Duration) {
 	t.data.Stage = stage
 	if len(t.data.Events) < 64 {
 		t.data.Events = append(t.data.Events, Event{Stage: stage, Model: model, ElapsedMS: elapsed, WaitMS: wait.Milliseconds()})
+	}
+}
+
+func Usage(ctx context.Context, input, output int) {
+	if t, ok := ctx.Value(contextKey{}).(*Trace); ok {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.data.InputTokens = max(0, input)
+		t.data.OutputTokens = max(0, output)
+		t.data.UsageKnown = true
 	}
 }
 

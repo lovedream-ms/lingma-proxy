@@ -7,11 +7,11 @@ import (
 	"unicode/utf8"
 )
 
-var secretLogPattern = regexp.MustCompile(`(?i)("(?:api_key|admin_key|password|access_token|refresh_token|authorization|cookie)"\s*:\s*")[^"]*(")`)
+var secretLogPattern = regexp.MustCompile(`(?i)("(?:api_key|admin_key|password|access_token|refresh_token|authorization|cookie)"\s*:\s*")[^"\r\n]*(?:"|$)`)
 var bearerLogPattern = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)
 
 func limitRecorded(text string, limit int) string {
-	text = secretLogPattern.ReplaceAllString(text, "${1}[REDACTED]${2}")
+	text = secretLogPattern.ReplaceAllString(text, "${1}[REDACTED]\"")
 	text = bearerLogPattern.ReplaceAllString(text, "Bearer [REDACTED]")
 	if len(text) <= limit {
 		return text

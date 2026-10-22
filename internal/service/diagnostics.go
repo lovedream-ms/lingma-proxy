@@ -67,8 +67,12 @@ func (s *Service) Diagnose(ctx context.Context, generate bool) []Diagnostic {
 		return append(out, DiagnoseError(err))
 	}
 	found := false
+	selected := s.DefaultModel()
+	if target := s.cfg.ModelAliases[selected]; target != "" {
+		selected = target
+	}
 	for _, model := range models {
-		if model.ID == s.DefaultModel() || strings.EqualFold(model.Name, s.DefaultModel()) {
+		if model.ID == selected || strings.EqualFold(model.Name, selected) {
 			found = true
 		}
 	}

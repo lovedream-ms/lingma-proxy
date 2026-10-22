@@ -103,7 +103,7 @@ onMounted(loadCachedModels)
       <div class="panel-header">
         <div>
           <h2>可用模型</h2>
-          <p>模型、上下文和图像能力以当前账号返回的目录为准。</p>
+          <p>模型目录、代理适配路径与当前环境可用性分别显示。标记不代表此模型已通过生成测试；上下文可能包含兼容提示。</p>
         </div>
         <input v-model="query" class="search-input" type="search" placeholder="搜索模型" style="max-width: 260px" />
       </div>
@@ -130,6 +130,9 @@ onMounted(loadCachedModels)
             <span class="spec-chip strong">{{ modelSpec(model).context }}</span>
             <span class="spec-chip">{{ modelSpec(model).capability }}</span>
             <span class="spec-chip muted-chip">{{ modelSpec(model).source }}</span>
+ <span class="spec-chip" :title="model.adapter_capabilities?.tools?.detail">工具：提示适配</span>
+ <span class="spec-chip" :title="model.adapter_capabilities?.images?.detail">图像：需要 IPC</span>
+ <span class="spec-chip" :title="model.adapter_capabilities?.structured_output?.detail">严格 JSON Schema：不支持</span>
           </div>
         </button>
       </div>

@@ -41,6 +41,8 @@ const (
 const ipcSetupTimeout = 15 * time.Second
 
 type Config struct {
+	ModelAliases map[string]string
+
 	APIKey              string
 	AdminKey            string
 	AllowedOrigins      []string
@@ -422,6 +424,7 @@ func (s *Service) Generate(ctx context.Context, req ChatRequest) (result *ChatRe
 			result.StartTime = started
 			result.EndTime = time.Now()
 			s.completeContextUsage(result)
+			observe.Usage(ctx, result.InputTokens, result.OutputTokens)
 		}
 	}()
 
@@ -472,6 +475,7 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 			result.FirstTokenTime = firstToken
 			result.EndTime = time.Now()
 			s.completeContextUsage(result)
+			observe.Usage(ctx, result.InputTokens, result.OutputTokens)
 		}
 		close(events)
 		done <- StreamResult{Result: result, Err: err}
@@ -1010,6 +1014,9 @@ func (s *Service) remoteAttemptModels(ctx context.Context, primary string) []str
 
 func (s *Service) resolveRemoteModelID(model string) string {
 	model = strings.TrimSpace(model)
+	if target := s.cfg.ModelAliases[model]; target != "" {
+		model = target
+	}
 	s.mu.Lock()
 	resolved := s.modelMap[model]
 	if resolved == "" {
