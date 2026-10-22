@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased (target: v1.6.16)
+## Unreleased (target: v1.6.17)
+
+## v1.6.17 - 2026-10-22
+
+- Add non-generating diagnostics, explicitly requested minimal generation checks, live request stages, request IDs, queue deadlines, first-upstream-activity timing, and model/retry/fallback history.
+- Protect non-loopback listeners with client keys; isolate debug access with an optional management key and restrict browser origins. Deployment bundles include a fresh client key.
+- Default to failure-only bodies; cap request size, retained body bytes, history age and total history size. Remove raw Anthropic stdout dumps and preserve usage independently of body logging and client usage opt-out.
+- Add previewed Claude Code / Codex CLI / Continue configuration merges with exact original backups, conflict checks and guarded restore. Codex uses a named profile without replacing the existing default.
+- Add stable model aliases, explicit adapter capability profiles and daily/model usage trends scoped to retained history. Strict JSON Schema and upstream account balances remain unsupported/unknown.
+- Personal-use defaults: 30-second queue wait, 32 MiB request body limit, 64 KiB recorded body limit, seven-day retention and 16 MiB history budget.
+- 新增诊断、请求过程、访问保护、日志容量控制、客户端配置助手、能力说明和用量趋势；保留现有 API 与工具回归。
 
 ## v1.6.16 - 2026-10-21
 

@@ -17,7 +17,7 @@ This checkout tracks the complete application source directly. Build with PowerS
 .\scripts\build-all.ps1 -Target Headless   # Console binary in cache/build
 ```
 
-The entry point downloads checksum-verified Go 1.23.6 and Node 20.20.2 into `cache/toolchain` and installs the pinned Wails CLI. Linux builds require an existing WSL distribution (default `Ubuntu-24.04`, selectable with `-Distro`) and prepare an isolated Focal rootfs. Native Focal builds use `scripts/build-ubuntu2004-gui.sh`. The GUI retains DevTools and links WebKitGTK 4.0 and legacy AppIndicator. Full builds publish exactly one Windows EXE and one Linux DEB to `dist`; intermediate material stays in `cache`. `-SkipFrontend` reuses previously built assets. Install the DEB with `sudo apt install --fix-broken ./dist/lingma-proxy-desktop-ubuntu20.04_1.6.16_amd64.deb`.
+The entry point downloads checksum-verified Go 1.23.6 and Node 20.20.2 into `cache/toolchain` and installs the pinned Wails CLI. Linux builds require an existing WSL distribution (default `Ubuntu-24.04`, selectable with `-Distro`) and prepare an isolated Focal rootfs. Native Focal builds use `scripts/build-ubuntu2004-gui.sh`. The GUI retains DevTools and links WebKitGTK 4.0 and legacy AppIndicator. Full builds publish exactly one Windows EXE and one Linux DEB to `dist`; intermediate material stays in `cache`. `-SkipFrontend` reuses previously built assets. Install the DEB with `sudo apt install --fix-broken ./dist/lingma-proxy-desktop-ubuntu20.04_1.6.17_amd64.deb`.
 
 Closing the desktop window keeps the proxy serving; use the tray to restore or explicitly quit. Linux without a tray host minimizes to the taskbar. Login autostart is a separate user setting. Settings expose the default model, concurrency (1–16), remote retries (0–10), backoff and tool stream compatibility. Explicit zero/false settings survive restart and server-bundle export. No extra system service is required.
 
@@ -25,6 +25,15 @@ Windows can read the current user's newer QoderCN Electron login through DPAPI w
 
 GUI and console share the config file selected by `LINGMA_PROXY_CONFIG`; otherwise existing configuration is reused, with `~/.config/lingma-proxy/config.json` as the default save path. Explicit desktop profiles have separate instance locks and `<config>.state.json` caches. Use port 8096 and a separate config for verification alongside an existing 8095 instance. Protocol contracts and client limitations are in [usage-reporting.md](docs/usage-reporting.md). Run `go test ./...` and `go vet ./...` after building the frontend; Linux additionally needs the GTK/WebKit/AppIndicator development packages and `-tags legacy_appindicator`.
 
+
+## Personal-use controls
+
+- **Diagnostics** checks credentials and the model catalogue without generation. The separate minimal generation button consumes account quota. Request details show request IDs, queue time, first upstream activity, retries and actual model selection.
+- **Access** defaults to loopback. Non-loopback listeners require `api_key` (or `LINGMA_PROXY_API_KEY`). Send it through `Authorization: Bearer <key>` or `x-api-key`. Debug endpoints require `admin_key` when configured; otherwise they are limited to authenticated loopback access. `allowed_origins` accepts explicit browser origins, never `*`. Exported server bundles contain a fresh client key in `ACCESS_KEY.txt`.
+- **Logs** default to `log_mode: "errors"`; choose `metadata`, `errors` or `full` in Settings. Defaults are 64 KiB per recorded body, 16 MiB of history and seven-day retention. History expiry does not reset cumulative usage; daily/model trends cover retained inference records only. Large request bodies are limited to 32 MiB by default.
+- **Client setup** previews and merges Claude Code, Codex CLI and Continue configuration only after clicking Apply. Exact originals are backed up alongside the client config; stale previews and restores after subsequent changes are rejected. Codex adds the `lingma_proxy` profile: run `codex --profile lingma_proxy`. Existing defaults remain unchanged. TOML/YAML comments are preserved in backups, not in regenerated configuration.
+- **Capabilities** describe the actual adapter path. Current tool requests use prompt/action adaptation; images require working IPC; strict JSON Schema is not enforced. Capability labels are not per-model generation test results. Unknown account balances and fees are not fabricated.
+- Optional `model_aliases` map stable client names to upstream IDs, for example `{"coding":"kmodel"}`. Configure them in Settings.
 
 ## Model Availability Disclaimer
 
@@ -66,7 +75,7 @@ Auto-detection prefers QoderCN runtime files first, then falls back to Lingma ru
 ## Current Version
 
 <!-- VERSION:CURRENT:BEGIN -->
-Current desktop app version: `v1.6.16`.
+Current desktop app version: `v1.6.17`.
 
 The canonical source is [VERSION](./VERSION). Run `./scripts/sync-version.sh` to propagate it into [desktop/wails.json](./desktop/wails.json), the desktop UI, and release-facing docs.
 <!-- VERSION:CURRENT:END -->
