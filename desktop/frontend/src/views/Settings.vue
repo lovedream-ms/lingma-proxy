@@ -62,6 +62,7 @@ const selectLabel = computed(() => (field) => {
   return option?.label || '请选择'
 })
 
+function randomKey() { return Array.from(crypto.getRandomValues(new Uint8Array(32)),v=>v.toString(16).padStart(2,'0')).join('') }
 function toggleSelect(field) {
   openSelect.value = openSelect.value === field ? '' : field
 }
@@ -170,7 +171,22 @@ async function openBundleFolder() {
       </button>
     </div>
 
-    <section class="grid-2 settings-grid">
+    <section class="glass-panel">
+ <h2>访问与日志</h2>
+ <p>本机监听可留空密钥；局域网监听必须设置访问密钥。管理密钥只用于调试接口，未设置时调试仅限本机。</p>
+ <div class="form-grid">
+  <div class="field"><label>代理访问密钥</label><input v-model="config.APIKey" type="password" autocomplete="new-password" /><button class="secondary-button" type="button" @click="config.APIKey=randomKey()">生成随机密钥</button></div>
+  <div class="field"><label>管理密钥（可选）</label><input v-model="config.AdminKey" type="password" autocomplete="new-password" /><button class="secondary-button" type="button" @click="config.AdminKey=randomKey()">生成管理密钥</button></div>
+  <div class="field"><label>浏览器允许来源（每行一个完整 Origin）</label><textarea :value="(config.AllowedOrigins || []).join('\n')" @input="config.AllowedOrigins=$event.target.value.split(/\n/).map(v=>v.trim()).filter(Boolean)" placeholder="http://localhost:3000" /></div>
+  <div class="field"><label>正文记录</label><select v-model="config.LogMode"><option value="metadata">仅元数据</option><option value="errors">仅失败正文（默认）</option><option value="full">完整正文（受容量限制）</option></select><small>统计始终保留；修改并保存后也会清理已有正文。</small></div>
+  <div class="field"><label>单条正文上限（字节）</label><input v-model.number="config.LogBodyMaxBytes" type="number" min="1024" max="1048576" /></div>
+  <div class="field"><label>历史记录总上限（字节）</label><input v-model.number="config.LogMaxBytes" type="number" min="1048576" max="134217728" /></div>
+  <div class="field"><label>记录保留天数</label><input v-model.number="config.LogRetentionDays" type="number" min="1" max="365" /></div>
+  <div class="field"><label>请求体上限（字节，包含图片）</label><input v-model.number="config.MaxRequestBytes" type="number" min="1024" max="134217728" /></div>
+  <div class="field"><label>排队等待上限（秒）</label><input v-model.number="config.QueueTimeoutSeconds" type="number" min="1" max="600" /></div>
+ </div>
+</section>
+<section class="grid-2 settings-grid">
       <div class="glass-panel">
         <div class="panel-header">
           <div>

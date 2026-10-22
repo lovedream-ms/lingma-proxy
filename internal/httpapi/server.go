@@ -207,13 +207,16 @@ func NewServer(addr string, svc *service.Service) *Server {
 
 	s.http = &http.Server{
 		Addr:              addr,
-		Handler:           s.withRecorder(withCORS(mux)),
+		Handler:           s.withAccess(s.withRecorder(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
 }
 
 func (s *Server) ListenAndServe() error {
+	if err := s.validateListener(); err != nil {
+		return err
+	}
 	return s.http.ListenAndServe()
 }
 
@@ -715,7 +718,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !s.acquire(r.Context()) {
-		writeAnthropicError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
+		writeAnthropicError(w, http.StatusRequestTimeout, "timeout_error", "proxy queue deadline exceeded or request canceled")
 		return
 	}
 	defer s.release()
@@ -724,10 +727,6 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if err := decodeJSON(r, &req); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
-	}
-
-	if reqBody, _ := json.Marshal(req); len(reqBody) > 0 {
-		fmt.Printf("[ANTHROPIC REQUEST] %s\n", string(reqBody))
 	}
 
 	if call, ok := anthropicHostedWebSearchCall(req); ok {
@@ -2920,6 +2919,8 @@ func writeOpenAIChunk(w http.ResponseWriter, flusher http.Flusher, payload any) 
 type recordingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
+	limit      int
+	usage      observe.UsageCapture
 	body       []byte
 	wrote      bool
 }
@@ -2934,7 +2935,13 @@ func (rw *recordingResponseWriter) Write(b []byte) (int, error) {
 	if !rw.wrote {
 		rw.WriteHeader(http.StatusOK)
 	}
-	rw.body = append(rw.body, b...)
+	rw.usage.Write(b)
+	limit := rw.limit
+	if limit <= 0 {
+		limit = 65536
+	}
+	remaining := max(0, limit-len(rw.body))
+	rw.body = append(rw.body, b[:min(len(b), remaining)]...)
 	return rw.ResponseWriter.Write(b)
 }
 
@@ -2963,12 +2970,19 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		// Read request body for recording, then restore for downstream handler
 		var reqBody string
 		if r.Body != nil && r.Body != http.NoBody {
-			body, _ := io.ReadAll(r.Body)
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(s.svc.RuntimeConfig().MaxRequestBytes)))
+			if err != nil {
+				writeOpenAIError(w, 413, "request_too_large", "请求体超过限制或读取失败")
+				return
+			}
+			var model struct{ Model string }
+			_ = json.Unmarshal(body, &model)
+			observe.Requested(r.Context(), model.Model)
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			reqBody = sanitizeRecordedBody(body)
+			reqBody = limitRecorded(sanitizeRecordedBody(body), s.svc.RuntimeConfig().LogBodyMaxBytes)
 		}
 
-		rw := &recordingResponseWriter{ResponseWriter: w, statusCode: 200}
+		rw := &recordingResponseWriter{ResponseWriter: w, statusCode: 200, limit: s.svc.RuntimeConfig().LogBodyMaxBytes}
 		next.ServeHTTP(rw, r)
 		duration := time.Since(start)
 
@@ -2983,12 +2997,15 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		if failure := trace.Snapshot(); failure.ErrorCode != "" {
 			diagnosis = service.Diagnostic{Code: failure.ErrorCode, Status: "error", Message: failure.ErrorMessage, Action: failure.Action}
 		}
-		record := DebugRequestRecord{Time: time.Now().Format(time.RFC3339), Method: r.Method, Path: r.URL.Path, StatusCode: rw.statusCode, DurationMS: duration.Milliseconds(), Request: reqBody, Response: respBody, Trace: trace.Snapshot(), Diagnosis: diagnosis}
+		cfg := s.svc.RuntimeConfig()
+		if cfg.LogMode == "metadata" || cfg.LogMode == "errors" && diagnosis.Status != "error" {
+			reqBody = ""
+			respBody = ""
+		}
+		record := DebugRequestRecord{InputTokens: rw.usage.Input, OutputTokens: rw.usage.Output, Time: time.Now().Format(time.RFC3339), Method: r.Method, Path: r.URL.Path, StatusCode: rw.statusCode, DurationMS: duration.Milliseconds(), Request: reqBody, Response: respBody, Trace: trace.Snapshot(), Diagnosis: diagnosis}
 		s.recMu.Lock()
 		s.records = append(s.records, record)
-		if len(s.records) > 200 {
-			s.records = s.records[len(s.records)-200:]
-		}
+		s.pruneRecordsLocked()
 		s.recMu.Unlock()
 		if s.OnRecord != nil {
 			s.OnRecord(record)
@@ -3041,8 +3058,9 @@ func (s *Server) recordRequest(method, path string, statusCode int, duration tim
 }
 
 func (s *Server) debugRecords(limit int) []debugRequestRecord {
-	s.recMu.RLock()
-	defer s.recMu.RUnlock()
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.pruneRecordsLocked()
 
 	if limit > len(s.records) {
 		limit = len(s.records)
@@ -3096,6 +3114,10 @@ func redactRecordedValue(value any) any {
 		out := make(map[string]any, len(typed))
 		for k, v := range typed {
 			lower := strings.ToLower(k)
+			if lower == "api_key" || lower == "apikey" || lower == "admin_key" || lower == "authorization" || lower == "password" || lower == "access_token" || lower == "refresh_token" || lower == "cookie" {
+				out[k] = "[REDACTED]"
+				continue
+			}
 			if lower == "data" || lower == "url" {
 				if s := stringFromAny(v); looksLikeImagePayload(s) {
 					out[k] = imageRedaction(s)
@@ -3155,7 +3177,7 @@ func mustMarshalJSON(value any) []byte {
 }
 
 func truncateRecordedString(value string) string {
-	return value
+	return limitRecorded(value, 1024*1024)
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -3173,11 +3195,14 @@ func withCORS(next http.Handler) http.Handler {
 
 func (s *Server) acquire(ctx context.Context) bool {
 	observe.Emit(ctx, "queued", "", 0)
+	queueCtx, cancel := context.WithTimeout(ctx, time.Duration(s.svc.RuntimeConfig().QueueTimeoutSeconds)*time.Second)
+	defer cancel()
 	select {
 	case s.sem <- struct{}{}:
 		observe.Emit(ctx, "upstream", "", 0)
 		return true
-	case <-ctx.Done():
+	case <-queueCtx.Done():
+		observe.Fail(ctx, "queue_timeout", "排队等待超时或请求已取消", "降低并发请求数量，或调整排队上限")
 		return false
 	}
 }

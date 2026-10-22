@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"archive/zip"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -71,7 +73,15 @@ func WriteServerBundle(options ServerBundleOptions) (ServerBundleResult, error) 
 		return result, err
 	}
 
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return result, err
+	}
+	accessKey := hex.EncodeToString(keyBytes)
 	fileCfg := map[string]any{
+		"api_key":  accessKey,
+		"log_mode": "errors",
+
 		"host":                    options.Host,
 		"port":                    options.Port,
 		"backend":                 string(service.BackendRemote),
@@ -102,8 +112,9 @@ func WriteServerBundle(options ServerBundleOptions) (ServerBundleResult, error) 
 	}
 
 	entries := []zipEntry{
+		{name: "ACCESS_KEY.txt", body: []byte("Use this client key in Authorization: Bearer <key> or x-api-key:\n" + accessKey + "\nDebug endpoints remain local-only.\n"), mode: 0600},
 		{name: "credentials.json", body: credentialJSON, mode: 0600},
-		{name: "lingma-proxy.json", body: configJSON, mode: 0644},
+		{name: "lingma-proxy.json", body: configJSON, mode: 0600},
 		{name: "docker-compose.yml", body: []byte(dockerComposeYAML(options.Port)), mode: 0644},
 		{name: "README.txt", body: []byte(bundleReadme(options.Port)), mode: 0644},
 	}

@@ -41,6 +41,16 @@ const (
 const ipcSetupTimeout = 15 * time.Second
 
 type Config struct {
+	APIKey              string
+	AdminKey            string
+	AllowedOrigins      []string
+	LogMode             string
+	LogBodyMaxBytes     int
+	LogMaxBytes         int
+	LogRetentionDays    int
+	MaxRequestBytes     int
+	QueueTimeoutSeconds int
+
 	MaxConcurrentRequests  int
 	RemoteRetryCount       *int
 	RemoteRetryBaseDelayMS int

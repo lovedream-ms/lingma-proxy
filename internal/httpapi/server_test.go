@@ -257,6 +257,7 @@ func TestDebugAppLogsUsesProviderAndSkipsRecorder(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/debug/app-logs?limit=7&source=app", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
 	rec := httptest.NewRecorder()
 	server.http.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

@@ -490,6 +490,8 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 	}
 	a.mu.Lock()
 	a.cfg = cfg
+	a.pruneHistoryLocked()
+	a.flushAppStateLocked()
 	a.mu.Unlock()
 	a.emitLog("info", "Config saved to file")
 
@@ -556,6 +558,15 @@ func (a *App) saveConfig(cfg service.Config) error {
 		"remote_retry_count":         cfg.RemoteRetryCount,
 		"remote_retry_base_delay_ms": cfg.RemoteRetryBaseDelayMS,
 		"aggregate_tool_stream":      cfg.AggregateToolStream,
+		"api_key":                    cfg.APIKey,
+		"admin_key":                  cfg.AdminKey,
+		"allowed_origins":            cfg.AllowedOrigins,
+		"log_mode":                   cfg.LogMode,
+		"log_body_max_bytes":         cfg.LogBodyMaxBytes,
+		"log_max_bytes":              cfg.LogMaxBytes,
+		"log_retention_days":         cfg.LogRetentionDays,
+		"max_request_bytes":          cfg.MaxRequestBytes,
+		"queue_timeout_seconds":      cfg.QueueTimeoutSeconds,
 	}
 
 	// Preserve configuration fields not managed by the current UI version.
@@ -576,7 +587,7 @@ func (a *App) saveConfig(cfg service.Config) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // StartProxy starts the lingma-ipc-proxy HTTP server
@@ -593,14 +604,23 @@ func (a *App) StartProxy() error {
 	if err := remote.ValidateProxyURL(cfg.RemoteProxyURL); err != nil {
 		return err
 	}
+	if err := cfg.ValidateRuntimeSettings(); err != nil {
+		return err
+	}
 
 	svc := service.New(cfg)
 	server := httpapi.NewServer(addr, svc)
+	if err := server.ValidateListener(); err != nil {
+		return err
+	}
 	server.AppLogs = a.debugAppLogs
 	server.OnRecord = func(item httpapi.DebugRequestRecord) {
 		method, path, statusCode, duration, reqBody, respBody := item.Method, item.Path, item.StatusCode, time.Duration(item.DurationMS)*time.Millisecond, item.Request, item.Response
-		inputTokens, outputTokens := extractTokenUsage(respBody)
-		model := extractRequestModel(reqBody)
+		inputTokens, outputTokens := item.InputTokens, item.OutputTokens
+		model := item.Trace.ActualModel
+		if model == "" {
+			model = item.Trace.RequestedModel
+		}
 		record := RequestRecord{
 			Trace: item.Trace, Diagnosis: item.Diagnosis,
 			ID:           uuid.NewString(),
@@ -622,6 +642,7 @@ func (a *App) StartProxy() error {
 		}
 		a.mu.Lock()
 		a.requests = append(a.requests, record)
+		a.pruneHistoryLocked()
 		if len(a.requests) > 2000 {
 			a.requests = a.requests[len(a.requests)-2000:]
 		}
@@ -689,8 +710,9 @@ func (a *App) StartProxy() error {
 
 // GetLogSummaries returns recent logs with truncated messages for lightweight list rendering.
 func (a *App) GetLogSummaries() []AppLog {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruneHistoryLocked()
 	out := make([]AppLog, len(a.logs))
 	for i, entry := range a.logs {
 		cloned := entry
@@ -1026,8 +1048,9 @@ func (a *App) hasModels() bool {
 
 // GetRequestSummaries returns recent request records without large request/response bodies.
 func (a *App) GetRequestSummaries() []RequestRecord {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruneHistoryLocked()
 	out := make([]RequestRecord, len(a.requests))
 	for i, record := range a.requests {
 		cloned := record
@@ -1179,6 +1202,12 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 	if err != nil {
 		return nil, err
 	}
+	a.mu.RLock()
+	key := a.cfg.APIKey
+	a.mu.RUnlock()
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1190,6 +1219,9 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("模型目录返回 HTTP %d", resp.StatusCode)
+	}
 	var result struct {
 		Data []ModelInfo `json:"data"`
 	}
@@ -1299,6 +1331,7 @@ func (a *App) loadAppState() error {
 		a.stats.ByModel = map[string]int{}
 	}
 	a.reconcileTokenStatsLocked()
+	a.pruneHistoryLocked()
 	if migrated {
 		a.flushAppStateLocked()
 	}
@@ -1336,6 +1369,7 @@ func (a *App) flushAppStateLocked() {
 		runtime.LogWarningf(a.ctx, "create app state dir failed: %v", err)
 		return
 	}
+	a.pruneHistoryLocked()
 	state := appStateFile{
 		Requests: trimPersistedRequests(a.requests),
 		Logs:     trimPersistedLogs(a.logs),
